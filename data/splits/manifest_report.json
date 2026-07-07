@@ -1,0 +1,61 @@
+{
+  "created_at": "2026-07-07T15:12:12.178614+00:00",
+  "entries": [
+    {
+      "block_sizes": [
+        44,
+        44,
+        44,
+        44,
+        44
+      ],
+      "dataset": "bbq",
+      "dev_size": 220,
+      "fairness_metric": "bbq_bias",
+      "few_shot_size": 88,
+      "manifest_path": "data\\splits\\bbq_seed42.json",
+      "manifest_sha256": "7f1166c32f9da2c01b22b9f0792b59e141c05851894dab85d0e40c3f2e6d884f",
+      "n_blocks": 5,
+      "seed": 42,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        44,
+        44,
+        44,
+        44,
+        44
+      ],
+      "dataset": "bbq",
+      "dev_size": 220,
+      "fairness_metric": "bbq_bias",
+      "few_shot_size": 88,
+      "manifest_path": "data\\splits\\bbq_seed43.json",
+      "manifest_sha256": "f05b8b666040b6efa2773285734e12c727c79d6393ae5f71a4361387f43368bc",
+      "n_blocks": 5,
+      "seed": 43,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        44,
+        44,
+        44,
+        44,
+        44
+      ],
+      "dataset": "bbq",
+      "dev_size": 220,
+      "fairness_metric": "bbq_bias",
+      "few_shot_size": 88,
+      "manifest_path": "data\\splits\\bbq_seed44.json",
+      "manifest_sha256": "fb39ba6a2ffb63a9fd1b714e5ef6b79fe804aef2e63c1400d3bba5506904aac5",
+      "n_blocks": 5,
+      "seed": 44,
+      "test_size": 500
+    }
+  ],
+  "manifest_dir": "C:\\Users\\maheshwari\\PycharmProjects\\Tri_Fair\\data\\splits",
+  "regenerated": false
+}
