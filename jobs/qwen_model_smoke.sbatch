@@ -29,4 +29,4 @@ echo "Host: $(hostname)"
 echo "Python: $("$TF_PYTHON" --version)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
-"$TF_PYTHON" scripts/qwen_model_smoke.py
+"$TF_PYTHON" -m scripts.qwen_model_smoke
