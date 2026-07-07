@@ -29,20 +29,4 @@ echo "Host: $(hostname)"
 echo "Python: $("$TF_PYTHON" --version)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
-"$TF_PYTHON" - <<'PY'
-from pathlib import Path
-
-from src.config.model_configs import ALL_MODELS
-from src.helpers.llm_creation import create_llm
-
-config = ALL_MODELS["qwen-3-30b"]
-
-print("Model:", config.model)
-print("Revision:", config.llm_kwargs.get("revision"))
-print("Storage:", Path(config.model_storage_path).resolve())
-
-model = create_llm(config, seed=42)
-
-print("Wrapper:", type(model).__name__)
-print("Qwen model initialization: PASSED")
-PY
+"$TF_PYTHON" scripts/qwen_model_smoke.py
