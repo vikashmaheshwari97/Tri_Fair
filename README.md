@@ -1,8 +1,4 @@
-# Tri-Fair implementation patch
-
-This directory is an overlay for `mo374z/mo-capo` (the implementation reviewed at commit `265848bb6e0482ab7ef11028d0b8483f6560e724`). Copy its contents into a clean checkout of that repository, preserving paths.
-
-The implementation adds two optimizers:
+# The implementation adds two optimizers:
 
 - **Tri-Fair** — MO-CAPO with three objectives and group-aware intensification.
 - **NSGA-II-PO-Fair** — the same three objectives, but full-development evaluation without racing.
