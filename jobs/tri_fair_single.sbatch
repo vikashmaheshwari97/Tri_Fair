@@ -17,6 +17,9 @@
 # Example smoke test:
 #   sbatch jobs/tri_fair_single.sbatch qwen-3-30b bbq Tri-Fair 42 250000 fresh
 
+
+
+set -Eeuo pipefail
 module purge
 module load python/3.11.14
 module load python-venv/1.0
@@ -24,10 +27,9 @@ module load python-venv/1.0
 source "$HOME/venvs/tri-fair/bin/activate"
 export TF_PYTHON="$HOME/venvs/tri-fair/bin/python"
 
-echo "Python executable: $TF_PYTHON"
 "$TF_PYTHON" --version
 
-set -Eeuo pipefail
+
 if (($# < 4 || $# > 6)); then
   echo "Usage: sbatch $0 MODEL DATASET OPTIMIZER SEED [BUDGET] [RUN_MODE]" >&2
   exit 2

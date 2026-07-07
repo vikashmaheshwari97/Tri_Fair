@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=tf-eval
 #SBATCH --partition=gpu
 #SBATCH --nodelist=firefly1,firefly2,firefly3
 #SBATCH --nodes=1
@@ -7,11 +8,23 @@
 #SBATCH --gpus-per-task=1
 #SBATCH --hint=nomultithread
 #SBATCH --mem=160G
+#SBATCH --time=12:00:00
+#SBATCH --output=logs/tri_fair_eval_%j.out
+#SBATCH --error=logs/tri_fair_eval_%j.err
 
 # Evaluate one completed optimization stage on the untouched test manifest.
 # Usage: sbatch jobs/run_eval.sbatch MODEL DATASET OPTIMIZER SEED BUDGET
 
 set -Eeuo pipefail
+module purge
+module load python/3.11.14
+module load python-venv/1.0
+
+source "$HOME/venvs/tri-fair/bin/activate"
+export TF_PYTHON="$HOME/venvs/tri-fair/bin/python"
+
+"$TF_PYTHON" --version
+
 if (($# != 5)); then
   echo "Usage: sbatch $0 MODEL DATASET OPTIMIZER SEED BUDGET" >&2
   exit 2
