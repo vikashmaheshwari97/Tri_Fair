@@ -3,7 +3,8 @@
 
 -r analysis/requirements-analysis.txt
 
-promptolution[vllm]==2.2.3
+promptolution==2.2.3
+vllm==0.24.0
 datasets==5.0.0
 huggingface-hub==1.22.0
 pymoo==0.6.2
