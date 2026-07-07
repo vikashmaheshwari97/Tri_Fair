@@ -1,0 +1,9 @@
+6620e9f4bfb4b69dc69eac17c3364a1be74ad05c74a04acd86bc7fac7abca733  ./README_JOBS_SELECTION.md
+18962cf79bceead0521b6049211b0ad735fd865c11606a601e3ed0356503d9de  ./jobs/README.md
+191dd5f1baf4b84c439978e35b6605aa2db4f54c419a130f92e2fa5adb212baa  ./jobs/legacy/README.md
+b3546a6e36dde614caddeb67f47961fd9aa9028135456fa08423568cc9ed695a  ./jobs/lib/common.sh
+5afd8ba92a2a98871751bc24218b6629f6255b632a38878a3ee8cca4596ff931  ./jobs/run_eval.sbatch
+b0130b715e38d56ac5e372b5dec4d58c6891dceac75ce38051ba4ab55102bd5d  ./jobs/submit_evaluations.sh
+62a6ed882bdcb1a01aae5ac2423474f4fd82dc5c481450bbff61c188a02addca  ./jobs/submit_tri_fair.sh
+ba20c486b2b89df456c9af15f36c82613f9b0528d381c6a45ece6f5290f14f05  ./jobs/tri_fair_main.sbatch
+0c9331ae971fdce5b3ddc12286708140d9577f837c1cfee744375e5f3ccb6128  ./jobs/tri_fair_single.sbatch

@@ -1,0 +1,51 @@
+﻿# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE files
+.idea/
+.vscode/
+
+# Generated experiment output
+results/
+logs/
+analysis/output/
+
+# Downloaded models and datasets
+models/
+data/raw/
+data/cache/
+data/external/
+data/downloads/
+
+# Large generated files
+*.parquet
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+.DS_Store
+Thumbs.db
+
+# Local secrets and environment variables
+.env
+.env.*

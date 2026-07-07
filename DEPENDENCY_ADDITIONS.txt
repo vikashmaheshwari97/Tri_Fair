@@ -1,0 +1,13 @@
+# Add to [project].dependencies if not already available transitively:
+pandas>=2.2
+pyarrow>=18.0
+scikit-learn>=1.5
+huggingface-hub>=0.27
+
+# Existing [project.optional-dependencies.analysis] should include:
+pymoo>=0.6.1.6
+matplotlib>=3.10
+scipy>=1.14
+
+# Development/testing:
+pytest>=8.3
