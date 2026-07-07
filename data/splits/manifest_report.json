@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-07-07T15:12:12.178614+00:00",
+  "created_at": "2026-07-07T15:28:14.297618+00:00",
   "entries": [
     {
       "block_sizes": [
@@ -52,6 +52,102 @@
       "manifest_path": "data\\splits\\bbq_seed44.json",
       "manifest_sha256": "fb39ba6a2ffb63a9fd1b714e5ef6b79fe804aef2e63c1400d3bba5506904aac5",
       "n_blocks": 5,
+      "seed": 44,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        112,
+        112,
+        112
+      ],
+      "dataset": "bias_in_bios",
+      "dev_size": 336,
+      "fairness_metric": "bios_tpr_gap",
+      "few_shot_size": 112,
+      "manifest_path": "data\\splits\\bias_in_bios_seed42.json",
+      "manifest_sha256": "a2704f2ba3e4cb2adca2158f8336fe81c9995836e8feb6ec612e54bcc2dfe337",
+      "n_blocks": 3,
+      "seed": 42,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        112,
+        112,
+        112
+      ],
+      "dataset": "bias_in_bios",
+      "dev_size": 336,
+      "fairness_metric": "bios_tpr_gap",
+      "few_shot_size": 112,
+      "manifest_path": "data\\splits\\bias_in_bios_seed43.json",
+      "manifest_sha256": "9b1a15e06e2cfa81a7874ed456224f24dfe4eba8e15668ec15341bd7e362418e",
+      "n_blocks": 3,
+      "seed": 43,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        112,
+        112,
+        112
+      ],
+      "dataset": "bias_in_bios",
+      "dev_size": 336,
+      "fairness_metric": "bios_tpr_gap",
+      "few_shot_size": 112,
+      "manifest_path": "data\\splits\\bias_in_bios_seed44.json",
+      "manifest_sha256": "cee7df306bf70d848fc5112c3faa5e3ab7038cfb2bd8d37462f5df2c957eb7cc",
+      "n_blocks": 3,
+      "seed": 44,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        96,
+        96,
+        96
+      ],
+      "dataset": "civil_comments",
+      "dev_size": 288,
+      "fairness_metric": "civil_worst_group",
+      "few_shot_size": 96,
+      "manifest_path": "data\\splits\\civil_comments_seed42.json",
+      "manifest_sha256": "ef0fbf0c7573ea887bd123e81e244f60392808b1a287ef13aee5d0861326a1b3",
+      "n_blocks": 3,
+      "seed": 42,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        96,
+        96,
+        96
+      ],
+      "dataset": "civil_comments",
+      "dev_size": 288,
+      "fairness_metric": "civil_worst_group",
+      "few_shot_size": 96,
+      "manifest_path": "data\\splits\\civil_comments_seed43.json",
+      "manifest_sha256": "0a7a03e895f7255a2634eefb8577a8522152baa27a3ee6ff15d42865c9932425",
+      "n_blocks": 3,
+      "seed": 43,
+      "test_size": 500
+    },
+    {
+      "block_sizes": [
+        96,
+        96,
+        96
+      ],
+      "dataset": "civil_comments",
+      "dev_size": 288,
+      "fairness_metric": "civil_worst_group",
+      "few_shot_size": 96,
+      "manifest_path": "data\\splits\\civil_comments_seed44.json",
+      "manifest_sha256": "45c8d7869fb4c038030a733c6a5a49525271274c35f8e33922f4eda90d267e11",
+      "n_blocks": 3,
       "seed": 44,
       "test_size": 500
     }
