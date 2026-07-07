@@ -243,32 +243,76 @@ def _make_manifest_id(split: str, values: Iterable[object]) -> str:
 
 
 def _load_bbq(config: DatasetConfig) -> Dict[str, pd.DataFrame]:
-    frames = []
+    """Load pinned BBQ JSONL files without executing a dataset script."""
+
+    if not config.subsets:
+        raise ValueError("BBQ configuration must declare at least one subset")
+
+    frames: list[pd.DataFrame] = []
+
     for subset in config.subsets:
-        raw = load_dataset(
-            config.name,
-            name=subset,
-            split="test",
+        filename = f"data/{subset}.jsonl"
+
+        local_path = hf_hub_download(
+            repo_id=config.name,
+            filename=filename,
+            repo_type="dataset",
             revision=config.revision,
-        ).to_pandas()
-        raw["category"] = raw.get("category", subset)
+        )
+
+        try:
+            raw = pd.read_json(local_path, lines=True)
+        except ValueError as error:
+            raise ValueError(
+                f"Failed to parse BBQ subset {subset!r} from {filename!r} "
+                f"at revision {config.revision!r}"
+            ) from error
+
+        if raw.empty:
+            raise ValueError(
+                f"BBQ subset {subset!r} is empty at revision {config.revision!r}"
+            )
+
+        if "category" not in raw.columns:
+            raw["category"] = subset
+        else:
+            observed = set(raw["category"].dropna().astype(str).unique())
+            if observed and observed != {subset}:
+                raise ValueError(
+                    f"BBQ file {filename!r} contains categories "
+                    f"{sorted(observed)}; expected only {subset!r}"
+                )
+            raw["category"] = raw["category"].fillna(subset)
+
+        raw = raw.reset_index(drop=True)
         raw["_source_index"] = np.arange(len(raw), dtype=int)
         raw["_source_split"] = "test"
+
         raw = prepare_bbq_dataframe(raw)
+
         raw[MANIFEST_ID] = raw.apply(
             lambda row: _make_manifest_id(
-                "test", (row["category"], int(row["example_id"]))
+                "test",
+                (
+                    row["category"],
+                    int(row["example_id"]),
+                ),
             ),
             axis=1,
         )
+
         frames.append(raw)
+
     combined = pd.concat(frames, ignore_index=True)
+
     fairness = config.fairness
     assert fairness is not None
+
     combined = attach_official_target_locations(
         combined,
         cache_path=fairness.fairness_kwargs.get(
-            "official_metadata_cache", "data/external/bbq/additional_metadata.csv"
+            "official_metadata_cache",
+            "data/external/bbq/additional_metadata.csv",
         ),
         metadata_url=fairness.fairness_kwargs.get(
             "official_metadata_url",
@@ -277,16 +321,25 @@ def _load_bbq(config: DatasetConfig) -> Dict[str, pd.DataFrame]:
             "analysis_scripts/additional_metadata.csv",
         ),
         require_official=bool(
-            fairness.fairness_kwargs.get("require_official_metadata", False)
+            fairness.fairness_kwargs.get(
+                "require_official_metadata",
+                False,
+            )
         ),
     )
+
     if combined[MANIFEST_ID].duplicated().any():
         duplicates = (
-            combined.loc[combined[MANIFEST_ID].duplicated(), MANIFEST_ID]
+            combined.loc[
+                combined[MANIFEST_ID].duplicated(),
+                MANIFEST_ID,
+            ]
             .head()
             .tolist()
         )
+
         raise ValueError(f"Duplicate BBQ manifest IDs: {duplicates}")
+
     return {"test": combined}
 
 
