@@ -83,22 +83,25 @@ tf_stage_checkpoints() {
 }
 
 tf_python_command() {
-  # Populates the named array with a command that executes Python in the
-  # project's environment.
   local output_name="$1"
   local -n output_ref="$output_name"
-  if command -v uv >/dev/null 2>&1; then
+
+  if [[ -n "${TF_PYTHON:-}" ]]; then
+    [[ -x "$TF_PYTHON" ]] \
+      || tf_die "TF_PYTHON is not executable: $TF_PYTHON"
+    output_ref=("$TF_PYTHON")
+  elif [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+    output_ref=("$VIRTUAL_ENV/bin/python")
+  elif command -v uv >/dev/null 2>&1; then
     output_ref=(uv run python)
   elif [[ -x ".venv/bin/python" ]]; then
     output_ref=(.venv/bin/python)
-  elif [[ -x ".venv/Scripts/python.exe" ]]; then
-    output_ref=(.venv/Scripts/python.exe)
   elif command -v python3 >/dev/null 2>&1; then
     output_ref=(python3)
   elif command -v python >/dev/null 2>&1; then
     output_ref=(python)
   else
-    tf_die "No Python interpreter found (uv, .venv, python3, or python)"
+    tf_die "No usable Python interpreter found"
   fi
 }
 

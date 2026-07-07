@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tf-eval
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/tri_fair_eval_%j.out
-#SBATCH --error=logs/tri_fair_eval_%j.err
+#SBATCH --partition=gpu
+#SBATCH --nodelist=firefly1,firefly2,firefly3
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-task=1
+#SBATCH --hint=nomultithread
+#SBATCH --mem=160G
 
 # Evaluate one completed optimization stage on the untouched test manifest.
 # Usage: sbatch jobs/run_eval.sbatch MODEL DATASET OPTIMIZER SEED BUDGET

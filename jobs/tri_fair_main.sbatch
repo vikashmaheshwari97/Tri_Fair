@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tri-fair
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=24:00:00
-#SBATCH --output=logs/tri_fair_%A_%a.out
-#SBATCH --error=logs/tri_fair_%A_%a.err
+
+#SBATCH --partition=gpu
+#SBATCH --nodelist=firefly1,firefly2,firefly3
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-task=1
+#SBATCH --hint=nomultithread
+#SBATCH --mem=160G
 
 # Array bounds are supplied by jobs/submit_tri_fair.sh. This prevents the
 # model/dataset/method matrix from silently diverging from a hard-coded #SBATCH
 # --array line.
+
+module purge
+module load python/3.11.14
+module load python-venv/1.0
+
+source "$HOME/venvs/tri-fair/bin/activate"
+export TF_PYTHON="$HOME/venvs/tri-fair/bin/python"
+
+echo "Python executable: $TF_PYTHON"
+"$TF_PYTHON" --version
 
 set -Eeuo pipefail
 ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
