@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Dict, List
 
 from src.config.base_config import DatasetType
+from src.config.bios_prompt_guide import add_bios_prompt_guide
 
 INITIAL_PROMPTS: Dict[DatasetType, List[str]] = {
     "agnews": [
@@ -274,6 +275,14 @@ INITIAL_PROMPTS: Dict[DatasetType, List[str]] = {
         "non_toxic inside final-answer tags.",
     ],
 }
+
+
+# Bias-v2 prompt guide: applied only to Bias in Bios initial prompts.
+# BBQ and Civil Comments prompt pools remain unchanged.
+INITIAL_PROMPTS["bias_in_bios"] = [
+    add_bios_prompt_guide(prompt) for prompt in INITIAL_PROMPTS["bias_in_bios"]
+]
+
 
 for _dataset, _prompts in INITIAL_PROMPTS.items():
     if len(_prompts) < 6:
