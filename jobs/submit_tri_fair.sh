@@ -86,6 +86,7 @@ SBATCH_ARGS=(
 [[ -n "${TIME_LIMIT:-}" ]] && SBATCH_ARGS+=("--time=$TIME_LIMIT")
 [[ -n "${MEMORY:-}" ]] && SBATCH_ARGS+=("--mem=$MEMORY")
 [[ -n "${CPUS_PER_TASK:-}" ]] && SBATCH_ARGS+=("--cpus-per-task=$CPUS_PER_TASK")
+[[ -n "${NODELIST:-}" ]] && SBATCH_ARGS+=("--nodelist=$NODELIST")
 
 printf 'Tri-Fair submission plan\n'
 printf '  models:       %s\n' "$TF_MODELS"

@@ -204,7 +204,9 @@ tf_log "Optimization stage completed successfully: $logging_dir"
 # invalidating an otherwise valid optimization run and makes reruns idempotent.
 if tf_is_true "$AUTO_EVAL"; then
   export MANIFEST_DIR MAX_OUTPUT_TOKENS
-  if eval_job="$(sbatch --parsable jobs/run_eval.sbatch \
+  eval_sbatch_args=(--parsable)
+  [[ -n "${EVAL_NODELIST:-}" ]] && eval_sbatch_args+=("--nodelist=$EVAL_NODELIST")
+  if eval_job="$(sbatch "${eval_sbatch_args[@]}" jobs/run_eval.sbatch \
       "$model" "$dataset" "$optimizer" "$seed" "$BUDGET" 2>/dev/null)"; then
     tf_log "Submitted holdout evaluation job $eval_job for budget $BUDGET"
   else
