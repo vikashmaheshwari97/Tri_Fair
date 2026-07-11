@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import re
@@ -78,14 +78,20 @@ def run_one(args: argparse.Namespace) -> None:
     dataset_config = ALL_DATASETS[args.dataset]
     model_config = ALL_MODELS[args.model]
 
-    root = Path(f"results/tri_fair/{args.model}/{args.dataset}")
-    run_root = root / args.optimizer / f"seed{args.seed}"
-    logging_file = run_root / "logging_dir.txt"
+    if getattr(args, "logging_dir", ""):
+        logging_dir = Path(args.logging_dir).expanduser().resolve()
+    else:
+        root = Path(args.results_root) / args.model / args.dataset
+        run_root = root / args.optimizer / f"seed{args.seed}"
+        if args.budget_dir:
+            run_root = run_root / f"budget{args.budget}"
+        logging_file = run_root / "logging_dir.txt"
 
-    if not logging_file.is_file():
-        raise FileNotFoundError(logging_file)
+        if not logging_file.is_file():
+            raise FileNotFoundError(logging_file)
 
-    logging_dir = Path(logging_file.read_text().strip())
+        logging_dir = Path(logging_file.read_text().strip()).expanduser().resolve()
+
     eval_path = logging_dir / "eval.parquet"
 
     if not eval_path.is_file():
@@ -348,6 +354,17 @@ def main() -> None:
     parser.add_argument("--manifest-dir", default="data/splits")
     parser.add_argument("--max-output-tokens", type=int, default=16)
     parser.add_argument("--out-dir", default="analysis/output/bias_prediction_capture")
+    parser.add_argument("--results-root", default="results/tri_fair")
+    parser.add_argument(
+        "--budget-dir",
+        action="store_true",
+        help="Look for logging_dir.txt under .../seed<seed>/budget<budget>.",
+    )
+    parser.add_argument(
+        "--logging-dir",
+        default="",
+        help="Direct path to a completed run logging directory. Overrides --results-root.",
+    )
     parser.add_argument("--combine-only", action="store_true")
     args = parser.parse_args()
 
