@@ -1,29 +1,11 @@
 """MO-CAPO-style curated figures for Bias in Bios advanced run 170287.
 
-This script is intentionally for the recent temporary advanced Bias run, not the
-frozen multi-seed 1M main analysis.
+Creates the same style of figures as analysis/make_bias_1m_figures.py, but for
+one temporary advanced run:
+  results/tri_fair_bias_high_macro_f1/compact/qwen-3-30b/bias_in_bios/Tri-Fair/seed42/budget2000000
 
-Default input run:
-  results/tri_fair_bias_high_macro_f1/compact/
-    qwen-3-30b/bias_in_bios/Tri-Fair/seed42/budget2000000/logging_dir.txt
-
-Default prediction-capture directory:
-  analysis/output/bias_advanced_prediction_capture/job_170287_compact
-
-Default output directory:
-  analysis/output/curated_figures_bias_170287
-
-Figures:
-  1. Development incumbent trajectory over token budget.
-  2. Test Macro-F1 vs test cost scatter, highlighting the selected prompt.
-  3. Test Macro-F1 vs test unfairness scatter, highlighting the selected prompt.
-  4. Test cost vs unfairness scatter, colored by Macro-F1.
-  5. Prediction-capture per-profession F1 bar plot.
-  6. Prediction-capture compact confusion heatmap for the hardest labels.
-
-The figure style follows the earlier curated Bias MO-CAPO-style script, but this
-script reads the single run's raw files directly instead of aggregated
-analysis/output/run_metrics.csv and all_evaluations.parquet.
+Output:
+  analysis/output/curated_figures_bias_170287_mocapo_style
 """
 
 from __future__ import annotations
@@ -32,13 +14,13 @@ import argparse
 import json
 import math
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import matplotlib
 
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -51,18 +33,30 @@ SEED = 42
 JOB_ID = "170287"
 BUDGET = 2_000_000
 TIER = "compact"
+N_PREFERENCES = 500
+PREFERENCE_SEED = 2026
 
 DEFAULT_RESULTS_ROOT = "results/tri_fair_bias_high_macro_f1/compact"
-DEFAULT_OUT_DIR = "analysis/output/curated_figures_bias_170287"
-DEFAULT_PREDICTION_DIR = f"analysis/output/bias_advanced_prediction_capture/job_{JOB_ID}_{TIER}"
+DEFAULT_PRED_DIR = f"analysis/output/bias_advanced_prediction_capture/job_{JOB_ID}_{TIER}"
+DEFAULT_OUT_DIR = "analysis/output/curated_figures_bias_170287_mocapo_style"
 
 QWEN_INPUT_WEIGHT = 0.11
 QWEN_OUTPUT_WEIGHT = 0.41
+DISPLAY_NAME = {OPTIMIZER: "Tri-Fair"}
+COLORS = {OPTIMIZER: "black"}
+MARKERS = {OPTIMIZER: "o"}
 
-MAIN_COLOR = "black"
-ALT_COLOR = "#E69F00"
-ACCENT_COLOR = "#0072B2"
-BAD_COLOR = "#D55E00"
+
+@dataclass(frozen=True)
+class Bounds:
+    cost_max: float
+
+    def normalize(self, raw_minimize: np.ndarray) -> np.ndarray:
+        out = raw_minimize.astype(float).copy()
+        out[:, 0] = np.clip(out[:, 0], 0.0, 1.0)
+        out[:, 1] = np.clip(out[:, 1] / self.cost_max, 0.0, 1.1)
+        out[:, 2] = np.clip(out[:, 2], 0.0, 1.0)
+        return out
 
 
 def configure_style() -> None:
@@ -82,117 +76,98 @@ def configure_style() -> None:
     )
 
 
-def finite_numeric(series: pd.Series) -> np.ndarray:
-    return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+def num(s: pd.Series) -> np.ndarray:
+    return pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
 
 
-def read_json_if_exists(path: Path) -> dict[str, object]:
+def save(fig: plt.Figure, outdir: Path, stem: str) -> None:
+    fig.savefig(outdir / f"{stem}.pdf", bbox_inches="tight")
+    fig.savefig(outdir / f"{stem}.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def require(df: pd.DataFrame, columns: Iterable[str], name: str) -> None:
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"{name} is missing required columns: {missing}")
+
+
+def read_json(path: Path) -> dict[str, object]:
     if not path.is_file():
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        warnings.warn(f"Could not parse JSON file {path}: {exc}")
+        warnings.warn(f"Could not parse {path}: {exc}")
         return {}
-
-
-def write_markdown_table(df: pd.DataFrame, path: Path) -> None:
-    try:
-        text = df.to_markdown(index=False, floatfmt=".6f") + "\n"
-    except Exception:
-        text = df.to_csv(index=False)
-    path.write_text(text, encoding="utf-8")
-
-
-def save_figure(fig: plt.Figure, outdir: Path, stem: str) -> None:
-    fig.savefig(outdir / f"{stem}.png", bbox_inches="tight")
-    fig.savefig(outdir / f"{stem}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
-def require_columns(df: pd.DataFrame, columns: Iterable[str], *, name: str) -> None:
-    missing = [column for column in columns if column not in df.columns]
-    if missing:
-        raise ValueError(f"{name} is missing required columns: {missing}")
-
-
-def run_output_dir(args: argparse.Namespace) -> Path:
-    return (
-        Path(args.results_root)
-        / args.model
-        / args.dataset
-        / args.optimizer
-        / f"seed{args.seed}"
-        / f"budget{args.budget}"
-    )
 
 
 def resolve_logging_dir(args: argparse.Namespace) -> Path:
     if args.logging_dir:
-        logging_dir = Path(args.logging_dir).expanduser().resolve()
+        path = Path(args.logging_dir).expanduser().resolve()
     else:
-        pointer = run_output_dir(args) / "logging_dir.txt"
+        pointer = (
+            Path(args.results_root)
+            / args.model
+            / args.dataset
+            / args.optimizer
+            / f"seed{args.seed}"
+            / f"budget{args.budget}"
+            / "logging_dir.txt"
+        )
         if not pointer.is_file():
-            raise FileNotFoundError(
-                f"Missing logging_dir.txt: {pointer}\n"
-                "Pass --logging-dir directly if this run used a different output root."
-            )
-        logging_dir = Path(pointer.read_text(encoding="utf-8").strip()).expanduser()
-        if not logging_dir.is_absolute():
-            logging_dir = (pointer.parent / logging_dir).resolve()
-        else:
-            logging_dir = logging_dir.resolve()
+            raise FileNotFoundError(f"Missing logging_dir.txt: {pointer}")
+        raw = pointer.read_text(encoding="utf-8").strip()
+        path = Path(raw).expanduser()
+        path = (pointer.parent / path).resolve() if not path.is_absolute() else path.resolve()
 
-    if not logging_dir.is_dir():
-        raise FileNotFoundError(f"Resolved logging directory does not exist: {logging_dir}")
-    return logging_dir
+    if not path.is_dir():
+        raise FileNotFoundError(f"Resolved logging directory does not exist: {path}")
+    return path
 
 
-def load_run_files(args: argparse.Namespace) -> tuple[Path, pd.DataFrame, pd.DataFrame, dict[str, object]]:
-    logging_dir = resolve_logging_dir(args)
-    step_path = logging_dir / "step_results.parquet"
-    eval_path = logging_dir / "eval.parquet"
-    summary_path = logging_dir / "run_summary.json"
+def load_run(args: argparse.Namespace) -> tuple[Path, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    logdir = resolve_logging_dir(args)
+    step_path = logdir / "step_results.parquet"
+    eval_path = logdir / "eval.parquet"
 
-    missing = [str(path) for path in [step_path, eval_path] if not path.is_file()]
-    if missing:
-        raise FileNotFoundError("Missing required run files:\n" + "\n".join(missing))
+    if not step_path.is_file() or not eval_path.is_file():
+        raise FileNotFoundError(f"Missing {step_path} or {eval_path}")
 
-    step_results = pd.read_parquet(step_path)
-    evaluations = pd.read_parquet(eval_path)
-    run_summary = read_json_if_exists(summary_path)
+    return (
+        logdir,
+        pd.read_parquet(step_path),
+        pd.read_parquet(eval_path),
+        read_json(logdir / "run_summary.json"),
+    )
 
-    return logging_dir, step_results, evaluations, run_summary
 
+def load_prediction_outputs(
+    pred_dir: Path,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    summary = pred_dir / "bias_in_bios_best_prompt_prediction_summary.csv"
+    per_prof = pred_dir / "bias_in_bios_best_prompt_per_profession_f1.csv"
 
-def load_prediction_files(pred_dir: Path) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
-    """Return prediction summary, per-profession F1, confusion matrix."""
-    summary_path = pred_dir / "bias_in_bios_best_prompt_prediction_summary.csv"
-    per_prof_path = pred_dir / "bias_in_bios_best_prompt_per_profession_f1.csv"
+    if not summary.is_file():
+        found = sorted(pred_dir.glob("summary_*_seed*.csv"))
+        summary = found[0] if found else summary
 
-    if not summary_path.is_file():
-        candidates = sorted(pred_dir.glob("summary_*_seed*.csv"))
-        summary_path = candidates[0] if candidates else summary_path
+    if not per_prof.is_file():
+        found = sorted(pred_dir.glob("per_profession_f1_*_seed*.csv"))
+        per_prof = found[0] if found else per_prof
 
-    if not per_prof_path.is_file():
-        candidates = sorted(pred_dir.glob("per_profession_f1_*_seed*.csv"))
-        per_prof_path = candidates[0] if candidates else per_prof_path
+    confusion_files = sorted(pred_dir.glob("confusion_*_seed*.csv"))
+    confusion = (
+        confusion_files[0]
+        if confusion_files
+        else pred_dir / "confusion_Tri_Fair_seed42.csv"
+    )
 
-    confusion_candidates = sorted(pred_dir.glob("confusion_*_seed*.csv"))
-    confusion_path = confusion_candidates[0] if confusion_candidates else pred_dir / "confusion_Tri_Fair_seed42.csv"
-
-    summary = pd.read_csv(summary_path) if summary_path.is_file() else None
-    per_prof = pd.read_csv(per_prof_path) if per_prof_path.is_file() else None
-    confusion = pd.read_csv(confusion_path, index_col=0) if confusion_path.is_file() else None
-
-    if summary is None:
-        warnings.warn(f"Prediction summary not found under {pred_dir}")
-    if per_prof is None:
-        warnings.warn(f"Per-profession F1 file not found under {pred_dir}")
-    if confusion is None:
-        warnings.warn(f"Confusion matrix file not found under {pred_dir}")
-
-    return summary, per_prof, confusion
+    return (
+        pd.read_csv(summary) if summary.is_file() else None,
+        pd.read_csv(per_prof) if per_prof.is_file() else None,
+        pd.read_csv(confusion, index_col=0) if confusion.is_file() else None,
+    )
 
 
 def pareto_mask_minimize(values: np.ndarray) -> np.ndarray:
@@ -202,307 +177,532 @@ def pareto_mask_minimize(values: np.ndarray) -> np.ndarray:
 
     keep = np.ones(len(values), dtype=bool)
     for i in range(len(values)):
-        dominates_i = np.all(values <= values[i], axis=1) & np.any(values < values[i], axis=1)
-        dominates_i[i] = False
-        if np.any(dominates_i):
-            keep[i] = False
+        dominates = np.all(values <= values[i], axis=1) & np.any(
+            values < values[i], axis=1
+        )
+        dominates[i] = False
+        keep[i] = not np.any(dominates)
     return keep
 
 
-def eval_objective_matrix(frame: pd.DataFrame) -> np.ndarray:
+def preferences() -> np.ndarray:
+    return np.random.default_rng(PREFERENCE_SEED).dirichlet(
+        np.ones(3), size=N_PREFERENCES
+    )
+
+
+def r2(front: np.ndarray) -> float:
+    if len(front) == 0:
+        return float("nan")
+
+    weights = preferences()
+    utilities = np.max(weights[:, None, :] * front[None, :, :], axis=2)
+    return float(np.mean(np.min(utilities, axis=1)))
+
+
+def hv3(
+    front: np.ndarray,
+    ref: tuple[float, float, float] = (1.05, 1.05, 1.05),
+) -> float:
+    """Exact grid-sweep hypervolume for small normalized 3D minimization fronts."""
+    points = np.asarray(front, dtype=float)
+    if points.size == 0:
+        return 0.0
+
+    ref_arr = np.asarray(ref, dtype=float)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    points = points[np.all(points <= ref_arr, axis=1)]
+    if len(points) == 0:
+        return 0.0
+
+    points = points[pareto_mask_minimize(points)]
+    coords = [
+        np.sort(np.unique(np.r_[points[:, d], ref_arr[d]])) for d in range(3)
+    ]
+
+    hv = 0.0
+    for i in range(len(coords[0]) - 1):
+        for j in range(len(coords[1]) - 1):
+            for k in range(len(coords[2]) - 1):
+                low = np.array([coords[0][i], coords[1][j], coords[2][k]])
+                if np.any(np.all(points <= low, axis=1)):
+                    hv += float(
+                        (coords[0][i + 1] - coords[0][i])
+                        * (coords[1][j + 1] - coords[1][j])
+                        * (coords[2][k + 1] - coords[2][k])
+                    )
+    return hv
+
+
+def step_tokens(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    out = df.copy()
+
+    if "total_tokens_downstream" in out:
+        return out, "total_tokens_downstream"
+
+    if "actual_budget_tokens" in out:
+        return out, "actual_budget_tokens"
+
+    if {"input_tokens_downstream", "output_tokens_downstream"}.issubset(out.columns):
+        out["_total_tokens"] = num(out["input_tokens_downstream"]) + num(
+            out["output_tokens_downstream"]
+        )
+        return out, "_total_tokens"
+
+    raise ValueError(
+        "step_results needs total_tokens_downstream or input/output token columns"
+    )
+
+
+def stage_eval(evals: pd.DataFrame, budget: int) -> pd.DataFrame:
+    out = evals.copy()
+
+    if "budget_checkpoint" in out:
+        stage = out[out["budget_checkpoint"] == budget].copy()
+        if not stage.empty:
+            out = stage
+
+    if "test_fairness_ready" in out:
+        ready = out["test_fairness_ready"].fillna(False).astype(bool)
+        if ready.any():
+            out = out[ready].copy()
+
+    return out.reset_index(drop=True)
+
+
+def step_objectives(df: pd.DataFrame) -> np.ndarray:
     return np.column_stack(
         [
-            1.0 - finite_numeric(frame["test_quality"]),
-            finite_numeric(frame["test_cost"]),
-            finite_numeric(frame["test_fairness"]),
+            1.0 - num(df["quality"]),
+            num(df["cost"]),
+            num(df["fairness"]),
         ]
     )
 
 
-def evaluation_stage(evaluations: pd.DataFrame, budget: int) -> pd.DataFrame:
-    if "budget_checkpoint" in evaluations.columns:
-        stage = evaluations[evaluations["budget_checkpoint"] == budget].copy()
-        if not stage.empty:
-            return stage.reset_index(drop=True)
-    return evaluations.copy().reset_index(drop=True)
+def eval_objectives(df: pd.DataFrame) -> np.ndarray:
+    return np.column_stack(
+        [
+            1.0 - num(df["test_quality"]),
+            num(df["test_cost"]),
+            num(df["test_fairness"]),
+        ]
+    )
 
 
-def choose_best_eval_prompt(evaluations: pd.DataFrame, budget: int) -> pd.Series:
-    stage = evaluation_stage(evaluations, budget)
-    require_columns(stage, ["test_quality", "test_cost", "test_fairness"], name="eval.parquet")
+def infer_bounds(step_results: pd.DataFrame, evals: pd.DataFrame) -> Bounds:
+    vals: list[float] = []
+
+    if "cost" in step_results:
+        vals.append(float(np.nanmax(num(step_results["cost"]))))
+
+    for col in ["test_cost", "dev_cost", "cost"]:
+        if col in evals:
+            vals.append(float(np.nanmax(num(evals[col]))))
+
+    finite = [v for v in vals if np.isfinite(v)]
+    return Bounds(cost_max=max((max(finite) if finite else 1.0) * 1.05, 1.0))
+
+
+def build_step_metrics(step_results: pd.DataFrame, evals: pd.DataFrame) -> pd.DataFrame:
+    require(step_results, ["step", "quality", "cost", "fairness"], "step_results.parquet")
+
+    data, tok = step_tokens(step_results)
+
+    if "fairness_ready" in data:
+        ready = data["fairness_ready"].fillna(False).astype(bool)
+        if ready.any():
+            data = data[ready].copy()
+
+    bounds = infer_bounds(data, evals)
+    rows: list[dict[str, object]] = []
+
+    for step, group in data.groupby("step", sort=True):
+        group = group.copy()
+        for col in ["quality", "cost", "fairness", tok]:
+            group[col] = pd.to_numeric(group[col], errors="coerce")
+
+        group = group.dropna(subset=["quality", "cost", "fairness", tok])
+        if group.empty:
+            continue
+
+        norm = bounds.normalize(step_objectives(group))
+        norm = norm[np.all(np.isfinite(norm), axis=1)]
+        if len(norm) == 0:
+            continue
+
+        front = norm[pareto_mask_minimize(norm)]
+        best = group.sort_values(
+            ["quality", "fairness", "cost"],
+            ascending=[False, True, True],
+        ).iloc[0]
+
+        rows.append(
+            {
+                "run_key": f"{MODEL}/{DATASET}/{OPTIMIZER}/seed{SEED}/budget{BUDGET}",
+                "model": MODEL,
+                "dataset": DATASET,
+                "optimizer": OPTIMIZER,
+                "seed": SEED,
+                "step": int(step),
+                "actual_budget_tokens": int(group[tok].max()),
+                "dev_noisy_r2_proxy": r2(front),
+                "hv_dev_3d_proxy": hv3(front),
+                "dev_proxy_front_size": int(len(front)),
+                "normalization_cost_max": float(bounds.cost_max),
+                "step_best_quality": float(best["quality"]),
+                "step_best_cost": float(best["cost"]),
+                "step_best_fairness": float(best["fairness"]),
+                "n_candidates": int(len(group)),
+            }
+        )
+
+    if not rows:
+        raise RuntimeError("No valid stepwise rows could be computed")
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("actual_budget_tokens")
+        .reset_index(drop=True)
+    )
+
+
+def best_eval(evals: pd.DataFrame, budget: int) -> pd.Series:
+    stage = stage_eval(evals, budget)
+    require(stage, ["test_quality", "test_cost", "test_fairness"], "eval.parquet")
+
     return stage.sort_values(
         ["test_quality", "test_fairness", "test_cost"],
         ascending=[False, True, True],
     ).iloc[0]
 
 
-def step_token_column(step_results: pd.DataFrame) -> str:
-    for column in ["total_tokens_downstream", "actual_budget_tokens"]:
-        if column in step_results.columns:
-            return column
-    if {"input_tokens_downstream", "output_tokens_downstream"}.issubset(step_results.columns):
-        return "__computed_total_tokens_downstream"
-    raise ValueError(
-        "step_results.parquet needs total_tokens_downstream or input/output token columns."
+def test_front_metrics(evals: pd.DataFrame, budget: int, bounds: Bounds) -> dict[str, float]:
+    stage = stage_eval(evals, budget)
+    raw = eval_objectives(stage)
+    raw = raw[np.all(np.isfinite(raw), axis=1)]
+
+    if len(raw) == 0:
+        return {
+            "test_noisy_r2_proxy": float("nan"),
+            "hv_test_3d_proxy": float("nan"),
+            "test_front_size": 0,
+        }
+
+    norm = bounds.normalize(raw)
+    front = norm[pareto_mask_minimize(norm)]
+
+    return {
+        "test_noisy_r2_proxy": r2(front),
+        "hv_test_3d_proxy": hv3(front),
+        "test_front_size": int(len(front)),
+    }
+
+
+def step_curve_stats(
+    df: pd.DataFrame,
+    col: str,
+    max_budget: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    data = df[df["actual_budget_tokens"] <= max_budget].sort_values(
+        "actual_budget_tokens"
     )
 
+    x = num(data["actual_budget_tokens"]).astype(int)
+    y = num(data[col])
+    mask = np.isfinite(x) & np.isfinite(y)
 
-def prepare_stepwise_incumbents(step_results: pd.DataFrame) -> pd.DataFrame:
-    require_columns(step_results, ["step", "quality", "cost", "fairness"], name="step_results.parquet")
+    x = x[mask]
+    y = y[mask]
 
-    data = step_results.copy()
-    token_col = step_token_column(data)
-    if token_col == "__computed_total_tokens_downstream":
-        data[token_col] = finite_numeric(data["input_tokens_downstream"]) + finite_numeric(
-            data["output_tokens_downstream"]
-        )
-
-    if "fairness_ready" in data.columns:
-        ready = data["fairness_ready"].fillna(False).astype(bool)
-        if ready.any():
-            data = data[ready].copy()
-
-    rows: list[dict[str, object]] = []
-    best: pd.Series | None = None
-
-    for step, group in data.groupby("step", sort=True):
-        group = group.copy()
-        group["quality"] = pd.to_numeric(group["quality"], errors="coerce")
-        group["cost"] = pd.to_numeric(group["cost"], errors="coerce")
-        group["fairness"] = pd.to_numeric(group["fairness"], errors="coerce")
-        group[token_col] = pd.to_numeric(group[token_col], errors="coerce")
-        group = group.dropna(subset=["quality", "cost", "fairness", token_col])
-        if group.empty:
-            continue
-
-        step_best = group.sort_values(
-            ["quality", "fairness", "cost"],
-            ascending=[False, True, True],
-        ).iloc[0]
-
-        if best is None:
-            best = step_best
-        else:
-            old_key = (float(best["quality"]), -float(best["fairness"]), -float(best["cost"]))
-            new_key = (
-                float(step_best["quality"]),
-                -float(step_best["fairness"]),
-                -float(step_best["cost"]),
-            )
-            if new_key > old_key:
-                best = step_best
-
-        rows.append(
-            {
-                "step": int(step),
-                "actual_budget_tokens": int(group[token_col].max()),
-                "step_best_quality": float(step_best["quality"]),
-                "step_best_cost": float(step_best["cost"]),
-                "step_best_fairness": float(step_best["fairness"]),
-                "incumbent_quality": float(best["quality"]),
-                "incumbent_cost": float(best["cost"]),
-                "incumbent_fairness": float(best["fairness"]),
-                "n_candidates": int(len(group)),
-            }
-        )
-
-    if not rows:
-        raise RuntimeError("No valid stepwise rows could be built from step_results.parquet")
-
-    return pd.DataFrame(rows).sort_values("actual_budget_tokens").reset_index(drop=True)
+    return x, y, y, y
 
 
-def plot_stepwise_incumbent(stepwise: pd.DataFrame, outdir: Path) -> None:
-    x = stepwise["actual_budget_tokens"].to_numpy(dtype=float) / 1_000_000.0
+def plot_nR2(step_metrics: pd.DataFrame, outdir: Path, max_budget: int) -> None:
+    fig, ax = plt.subplots(figsize=(6.4, 4.0), constrained_layout=True)
 
-    fig, axes = plt.subplots(1, 3, figsize=(12.2, 3.8), constrained_layout=True)
+    x, y, lo, hi = step_curve_stats(step_metrics, "dev_noisy_r2_proxy", max_budget)
 
-    panels = [
-        ("incumbent_quality", "Dev Macro-F1 ↑", MAIN_COLOR),
-        ("incumbent_cost", "Dev Cost ↓", ALT_COLOR),
-        ("incumbent_fairness", "Dev Unfairness ↓", BAD_COLOR),
-    ]
-    for ax, (column, ylabel, color) in zip(axes, panels):
-        ax.step(x, stepwise[column], where="post", color=color, linewidth=2)
-        ax.scatter(x, stepwise[column], color=color, s=24, zorder=3)
-        ax.set_xlabel("Token Budget [×10⁶]")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.25)
-
-    fig.suptitle("Bias in Bios — Qwen-3-30B — Tri-Fair 2M compact trajectory", y=1.04)
-    save_figure(fig, outdir, "bias_170287_stepwise_incumbent_trajectory")
-
-
-def annotate_selected(ax: plt.Axes, best: pd.Series, x_col: str, y_col: str) -> None:
-    x = float(best[x_col])
-    y = float(best[y_col])
-    ax.scatter(
-        [x],
-        [y],
-        marker="*",
-        s=220,
-        color=BAD_COLOR,
-        edgecolor="black",
-        linewidth=0.7,
-        zorder=5,
+    ax.step(
+        x / 1_000_000,
+        y,
+        where="post",
+        color=COLORS[OPTIMIZER],
+        marker=MARKERS[OPTIMIZER],
+        linewidth=2,
+        markersize=4,
+        label=DISPLAY_NAME[OPTIMIZER],
     )
-    ax.annotate(
-        "selected best\nMacro-F1",
-        xy=(x, y),
-        xytext=(8, 10),
+    ax.fill_between(
+        x / 1_000_000,
+        lo,
+        hi,
+        step="post",
+        color=COLORS[OPTIMIZER],
+        alpha=0.16,
+    )
+
+    ax.set_title("Bias in Bios — Qwen-3-30B")
+    ax.set_xlabel("Token Budget [×10⁶]")
+    ax.set_ylabel("Development nR2 Proxy ↓")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="best")
+
+    ax.text(
+        0.02,
+        0.02,
+        "Single-seed advanced run.\nStepwise proxy from development objectives.",
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=7,
+        alpha=0.75,
+    )
+
+    save(fig, outdir, "bias_in_bios_qwen3_2m_nR2_trajectory_stepwise")
+
+
+def plot_hv_gap(step_metrics: pd.DataFrame, summary: pd.DataFrame, outdir: Path, max_budget: int) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+
+    x, y, lo, hi = step_curve_stats(step_metrics, "hv_dev_3d_proxy", max_budget)
+
+    axes[0].step(
+        x / 1_000_000,
+        y,
+        where="post",
+        color=COLORS[OPTIMIZER],
+        marker=MARKERS[OPTIMIZER],
+        linewidth=2,
+        markersize=4,
+        label=DISPLAY_NAME[OPTIMIZER],
+    )
+    axes[0].fill_between(
+        x / 1_000_000,
+        lo,
+        hi,
+        step="post",
+        color=COLORS[OPTIMIZER],
+        alpha=0.16,
+    )
+    axes[0].set_title("Development Hypervolume Proxy ↑")
+    axes[0].set_xlabel("Token Budget [×10⁶]")
+    axes[0].set_ylabel("Development HV Proxy")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend(frameon=False, loc="best")
+
+    gap = float(summary.iloc[0]["nR2 Gap Proxy ↓"])
+
+    axes[1].step(
+        [BUDGET / 1_000_000],
+        [gap],
+        where="post",
+        color=COLORS[OPTIMIZER],
+        marker=MARKERS[OPTIMIZER],
+        linewidth=2,
+        markersize=5,
+        label=DISPLAY_NAME[OPTIMIZER],
+    )
+    axes[1].scatter(
+        [BUDGET / 1_000_000],
+        [gap],
+        color=COLORS[OPTIMIZER],
+        s=40,
+        zorder=3,
+    )
+    axes[1].annotate(
+        f"{gap:.4f}",
+        xy=(BUDGET / 1_000_000, gap),
+        xytext=(6, 8),
         textcoords="offset points",
         fontsize=8,
-        arrowprops={"arrowstyle": "->", "lw": 0.8},
+    )
+    axes[1].set_title("Test-vs-Development nR2 Gap Proxy ↓")
+    axes[1].set_xlabel("Evaluation-token checkpoint [×10⁶]")
+    axes[1].set_ylabel("nR2 Gap Proxy")
+    axes[1].set_xticks([BUDGET / 1_000_000])
+    axes[1].set_xticklabels(["2M"])
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(frameon=False, loc="best")
+
+    fig.suptitle("Bias in Bios — Qwen-3-30B: Trajectory diagnostics", y=1.03)
+
+    save(fig, outdir, "bias_in_bios_qwen3_2m_hv_gap_trajectory_stepwise")
+
+
+def attained_y(front: pd.DataFrame, grid: np.ndarray, x_col: str) -> np.ndarray:
+    x = num(front[x_col])
+    y = num(front["test_quality"])
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    out = np.full(len(grid), np.nan)
+    for i, gx in enumerate(grid):
+        eligible = y[x <= gx]
+        if len(eligible):
+            out[i] = np.max(eligible)
+
+    return out
+
+
+def plot_attainment(evals: pd.DataFrame, outdir: Path, x_col: str, xlabel: str, filename: str) -> None:
+    final = stage_eval(evals, BUDGET)
+    require(final, [x_col, "test_quality", "test_cost", "test_fairness"], "eval.parquet")
+
+    xmin = float(np.nanmin(num(final[x_col])))
+    xmax = float(np.nanmax(num(final[x_col])))
+    pad = 0.03 * max(xmax - xmin, 1e-6)
+    grid = np.linspace(xmin - pad, xmax + pad, 400)
+
+    front = final.loc[pareto_mask_minimize(eval_objectives(final))].copy()
+    curve = attained_y(front, grid, x_col)
+    valid = np.isfinite(curve)
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.2), constrained_layout=True)
+
+    ax.step(
+        grid[valid],
+        curve[valid],
+        where="post",
+        color=COLORS[OPTIMIZER],
+        marker=MARKERS[OPTIMIZER],
+        markevery=max(1, int(valid.sum() / 8)),
+        linewidth=2,
+        markersize=4,
+        label=DISPLAY_NAME[OPTIMIZER],
+    )
+    ax.fill_between(
+        grid[valid],
+        curve[valid],
+        curve[valid],
+        step="post",
+        color=COLORS[OPTIMIZER],
+        alpha=0.16,
+    )
+
+    ax.set_title("Bias in Bios — Qwen-3-30B at 2M")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Test Macro-F1")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="lower right")
+
+    save(fig, outdir, filename)
+
+
+def fewshot_count(value: object) -> int:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return 0
+
+    if isinstance(value, list):
+        return len(value)
+
+    text = str(value).strip()
+    if not text:
+        return 0
+
+    try:
+        loaded = json.loads(text)
+        return len(loaded) if isinstance(loaded, list) else 0
+    except json.JSONDecodeError:
+        return 0
+
+
+def output_cost_share(df: pd.DataFrame) -> np.ndarray:
+    if {"test_input_tokens", "test_output_tokens"}.issubset(df.columns):
+        inp = num(df["test_input_tokens"])
+        out = num(df["test_output_tokens"])
+    elif {"input_tokens", "output_tokens"}.issubset(df.columns):
+        inp = num(df["input_tokens"])
+        out = num(df["output_tokens"])
+    else:
+        return np.zeros(len(df), dtype=float)
+
+    weighted_in = QWEN_INPUT_WEIGHT * inp
+    weighted_out = QWEN_OUTPUT_WEIGHT * out
+    denom = weighted_in + weighted_out
+
+    return np.divide(
+        weighted_out,
+        denom,
+        out=np.zeros_like(weighted_out),
+        where=denom > 0,
     )
 
 
-def plot_eval_macro_f1_vs_cost(evaluations: pd.DataFrame, best: pd.Series, outdir: Path, budget: int) -> None:
-    stage = evaluation_stage(evaluations, budget)
-    stage = stage.dropna(subset=["test_quality", "test_cost", "test_fairness"]).copy()
-    pareto = pareto_mask_minimize(eval_objective_matrix(stage))
+def final_candidates(evals: pd.DataFrame) -> pd.DataFrame:
+    data = stage_eval(evals, BUDGET)
 
-    fig, ax = plt.subplots(figsize=(6.6, 4.5), constrained_layout=True)
-    scatter = ax.scatter(
-        stage["test_cost"],
-        stage["test_quality"],
-        c=stage["test_fairness"],
-        cmap="viridis_r",
-        s=72,
+    if "is_incumbent" in data and data["is_incumbent"].notna().any():
+        inc = data[data["is_incumbent"].fillna(False).astype(bool)].copy()
+        if not inc.empty:
+            data = inc
+
+    data["fewshot_count"] = (
+        data["few_shots_json"].apply(fewshot_count)
+        if "few_shots_json" in data
+        else 0
+    )
+    data["output_cost_share"] = output_cost_share(data)
+
+    return data.reset_index(drop=True)
+
+
+def plot_fewshot_scatter(evals: pd.DataFrame, outdir: Path, color_col: str, label: str, filename: str) -> None:
+    data = final_candidates(evals)
+    values = num(data[color_col])
+
+    vmin = float(np.nanmin(values)) if np.isfinite(values).any() else 0.0
+    vmax = float(np.nanmax(values)) if np.isfinite(values).any() else 1.0
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-6
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.8), constrained_layout=True)
+
+    sc = ax.scatter(
+        data["test_cost"],
+        data["test_quality"],
+        c=values,
+        cmap="viridis",
+        vmin=vmin,
+        vmax=vmax,
         edgecolor="black",
         linewidth=0.5,
-        alpha=0.92,
-        label="evaluated prompts",
+        s=72,
+        alpha=0.95,
     )
-    if pareto.any():
-        front = stage.loc[pareto].sort_values("test_cost")
-        ax.plot(
-            front["test_cost"],
-            front["test_quality"],
-            color=MAIN_COLOR,
-            linewidth=1.6,
-            label="3D non-dominated front",
+
+    for _, row in data.iterrows():
+        ax.text(
+            float(row["test_cost"]),
+            float(row["test_quality"]) + 0.002,
+            str(int(row["fewshot_count"])),
+            ha="center",
+            va="bottom",
+            fontsize=7,
         )
 
-    annotate_selected(ax, best, "test_cost", "test_quality")
-    ax.set_title("Bias in Bios — Qwen-3-30B at 2M")
+    ax.set_title("Tri-Fair on Bias in Bios — Qwen-3-30B at 2M")
     ax.set_xlabel("Avg. Cost [$] per 1M Calls")
     ax.set_ylabel("Test Macro-F1")
     ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="lower right")
-    cbar = fig.colorbar(scatter, ax=ax)
-    cbar.set_label("Test Unfairness ↓")
-    save_figure(fig, outdir, "bias_170287_test_macro_f1_vs_cost")
+
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label(label)
+
+    save(fig, outdir, filename)
 
 
-def plot_eval_macro_f1_vs_unfairness(evaluations: pd.DataFrame, best: pd.Series, outdir: Path, budget: int) -> None:
-    stage = evaluation_stage(evaluations, budget)
-    stage = stage.dropna(subset=["test_quality", "test_cost", "test_fairness"]).copy()
-    pareto = pareto_mask_minimize(eval_objective_matrix(stage))
-
-    fig, ax = plt.subplots(figsize=(6.6, 4.5), constrained_layout=True)
-    scatter = ax.scatter(
-        stage["test_fairness"],
-        stage["test_quality"],
-        c=stage["test_cost"],
-        cmap="viridis",
-        s=72,
-        edgecolor="black",
-        linewidth=0.5,
-        alpha=0.92,
-        label="evaluated prompts",
-    )
-    if pareto.any():
-        front = stage.loc[pareto].sort_values("test_fairness")
-        ax.plot(
-            front["test_fairness"],
-            front["test_quality"],
-            color=MAIN_COLOR,
-            linewidth=1.6,
-            label="3D non-dominated front",
-        )
-
-    annotate_selected(ax, best, "test_fairness", "test_quality")
-    ax.set_title("Bias in Bios — Qwen-3-30B at 2M")
-    ax.set_xlabel("Test Unfairness ↓")
-    ax.set_ylabel("Test Macro-F1")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="lower right")
-    cbar = fig.colorbar(scatter, ax=ax)
-    cbar.set_label("Avg. Cost [$] per 1M Calls ↓")
-    save_figure(fig, outdir, "bias_170287_test_macro_f1_vs_unfairness")
+def clean_label(x: object) -> str:
+    return str(x).replace("true__", "").replace("pred__", "")
 
 
-def plot_cost_vs_unfairness(evaluations: pd.DataFrame, best: pd.Series, outdir: Path, budget: int) -> None:
-    stage = evaluation_stage(evaluations, budget)
-    stage = stage.dropna(subset=["test_quality", "test_cost", "test_fairness"]).copy()
-
-    fig, ax = plt.subplots(figsize=(6.4, 4.4), constrained_layout=True)
-    scatter = ax.scatter(
-        stage["test_cost"],
-        stage["test_fairness"],
-        c=stage["test_quality"],
-        cmap="viridis",
-        s=72,
-        edgecolor="black",
-        linewidth=0.5,
-        alpha=0.92,
-    )
-    annotate_selected(ax, best, "test_cost", "test_fairness")
-    ax.set_title("Bias in Bios — Cost/Fairness trade-off at 2M")
-    ax.set_xlabel("Avg. Cost [$] per 1M Calls ↓")
-    ax.set_ylabel("Test Unfairness ↓")
-    ax.grid(True, alpha=0.25)
-    cbar = fig.colorbar(scatter, ax=ax)
-    cbar.set_label("Test Macro-F1 ↑")
-    save_figure(fig, outdir, "bias_170287_test_cost_vs_unfairness")
-
-
-def plot_per_profession_f1(per_prof: pd.DataFrame, outdir: Path, worst_n: int = 28) -> None:
-    require_columns(per_prof, ["profession", "f1", "support"], name="per-profession F1 file")
-    data = per_prof.copy()
-    data["f1"] = pd.to_numeric(data["f1"], errors="coerce")
-    data["support"] = pd.to_numeric(data["support"], errors="coerce")
-    data = data.dropna(subset=["f1"]).sort_values("f1", ascending=True).head(worst_n)
-
-    height = max(5.0, 0.28 * len(data) + 1.5)
-    fig, ax = plt.subplots(figsize=(7.2, height), constrained_layout=True)
-    y = np.arange(len(data))
-    ax.barh(y, data["f1"], color=ACCENT_COLOR, alpha=0.88)
-    ax.set_yticks(y)
-    ax.set_yticklabels(data["profession"])
-    ax.invert_yaxis()
-    ax.set_xlim(0.0, 1.0)
-    ax.set_xlabel("F1")
-    ax.set_title("Bias in Bios — Prediction-capture per-profession F1")
-    ax.grid(True, axis="x", alpha=0.25)
-
-    for yi, (_, row) in enumerate(data.iterrows()):
-        support = int(row["support"]) if np.isfinite(row["support"]) else 0
-        ax.text(
-            float(row["f1"]) + 0.01,
-            yi,
-            f"{float(row['f1']):.3f}  n={support}",
-            va="center",
-            fontsize=8,
-        )
-
-    save_figure(fig, outdir, "bias_170287_per_profession_f1")
-
-
-def clean_label_name(value: object) -> str:
-    text = str(value)
-    text = text.replace("true__", "").replace("pred__", "")
-    return text
-
-
-def most_confused_labels(confusion: pd.DataFrame, per_prof: pd.DataFrame | None, n_labels: int = 12) -> list[str]:
-    cm = confusion.copy()
-    cm.index = [clean_label_name(x) for x in cm.index]
-    cm.columns = [clean_label_name(x) for x in cm.columns]
-
+def confusion_labels(cm: pd.DataFrame, per_prof: pd.DataFrame | None, n: int = 12) -> list[str]:
     labels: list[str] = []
+
     if per_prof is not None and {"profession", "f1"}.issubset(per_prof.columns):
-        worst = (
+        labels.extend(
             per_prof.assign(f1=pd.to_numeric(per_prof["f1"], errors="coerce"))
             .dropna(subset=["f1"])
             .sort_values("f1")
@@ -510,36 +710,33 @@ def most_confused_labels(confusion: pd.DataFrame, per_prof: pd.DataFrame | None,
             .astype(str)
             .tolist()
         )
-        labels.extend(worst)
 
-    offdiag = cm.copy()
-    for label in offdiag.index.intersection(offdiag.columns):
-        offdiag.loc[label, label] = 0
+    off = cm.copy()
+    for lab in off.index.intersection(off.columns):
+        off.loc[lab, lab] = 0
 
-    pairs = offdiag.stack().sort_values(ascending=False)
-    for (true_label, pred_label), count in pairs.items():
+    for (true, pred), count in off.stack().sort_values(ascending=False).items():
         if count <= 0:
             break
-        labels.extend([str(true_label), str(pred_label)])
-        if len(dict.fromkeys(labels)) >= n_labels:
+        labels.extend([str(true), str(pred)])
+        if len(dict.fromkeys(labels)) >= n:
             break
 
-    unique = list(dict.fromkeys(labels))
-    return [label for label in unique if label in cm.index and label in cm.columns][:n_labels]
+    return [x for x in dict.fromkeys(labels) if x in cm.index and x in cm.columns][:n]
 
 
-def plot_confusion_heatmap(confusion: pd.DataFrame, per_prof: pd.DataFrame | None, outdir: Path) -> None:
+def plot_confusion(confusion: pd.DataFrame, per_prof: pd.DataFrame | None, outdir: Path) -> None:
     cm = confusion.copy()
-    cm.index = [clean_label_name(x) for x in cm.index]
-    cm.columns = [clean_label_name(x) for x in cm.columns]
+    cm.index = [clean_label(x) for x in cm.index]
+    cm.columns = [clean_label(x) for x in cm.columns]
     cm = cm.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
 
-    labels = most_confused_labels(cm, per_prof, n_labels=12)
+    labels = confusion_labels(cm, per_prof)
     if not labels:
-        warnings.warn("Could not identify labels for compact confusion heatmap")
         return
 
     sub = cm.loc[labels, labels]
+
     fig, ax = plt.subplots(figsize=(8.2, 7.0), constrained_layout=True)
     im = ax.imshow(sub.to_numpy(dtype=float), cmap="Blues")
 
@@ -551,64 +748,74 @@ def plot_confusion_heatmap(confusion: pd.DataFrame, per_prof: pd.DataFrame | Non
     ax.set_ylabel("True label")
     ax.set_title("Bias in Bios — compact confusion matrix for hardest labels")
 
-    values = sub.to_numpy(dtype=int)
-    threshold = max(values.max() * 0.55, 1)
-    for i in range(values.shape[0]):
-        for j in range(values.shape[1]):
-            value = values[i, j]
-            if value > 0:
-                color = "white" if value >= threshold else "black"
-                ax.text(j, i, str(value), ha="center", va="center", fontsize=8, color=color)
+    vals = sub.to_numpy(dtype=int)
+    threshold = max(vals.max() * 0.55, 1)
 
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Count")
-    save_figure(fig, outdir, "bias_170287_confusion_hard_labels")
+    for i in range(vals.shape[0]):
+        for j in range(vals.shape[1]):
+            if vals[i, j] > 0:
+                ax.text(
+                    j,
+                    i,
+                    str(vals[i, j]),
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if vals[i, j] >= threshold else "black",
+                )
+
+    fig.colorbar(im, ax=ax).set_label("Count")
+
+    save(fig, outdir, "bias_in_bios_qwen3_2m_confusion_hard_labels")
 
 
-def build_summary_table(
+def build_summary(
     args: argparse.Namespace,
-    logging_dir: Path,
-    evaluations: pd.DataFrame,
-    best: pd.Series,
+    logdir: Path,
+    step_metrics: pd.DataFrame,
+    evals: pd.DataFrame,
     pred_summary: pd.DataFrame | None,
     run_summary: dict[str, object],
 ) -> pd.DataFrame:
-    stage = evaluation_stage(evaluations, args.budget)
-    row: dict[str, object] = {
-        "job_id": args.job_id,
-        "model": args.model,
-        "dataset": args.dataset,
-        "optimizer": args.optimizer,
-        "seed": args.seed,
-        "tier": args.tier,
-        "requested_budget": args.budget,
-        "logging_dir": str(logging_dir),
-        "eval_rows_at_budget": len(stage),
-        "best_prompt_id": best.get("prompt_id", "unknown"),
-        "chosen_step": best.get("chosen_step", np.nan),
-        "eval_macro_f1": float(best["test_quality"]),
-        "eval_cost": float(best["test_cost"]),
-        "eval_unfairness": float(best["test_fairness"]),
-        "eval_max_abs_tpr_gap": best.get("test_max_abs_tpr_gap", np.nan),
-        "test_fairness_ready": best.get("test_fairness_ready", np.nan),
-    }
+    best = best_eval(evals, args.budget)
+    final_dev = step_metrics.iloc[-1]
+    bounds = Bounds(cost_max=float(final_dev["normalization_cost_max"]))
+    test_metrics = test_front_metrics(evals, args.budget, bounds)
 
+    actual_tokens = int(step_metrics["actual_budget_tokens"].max())
     if "actual_tokens" in run_summary:
-        row["run_summary_actual_tokens"] = run_summary.get("actual_tokens")
-    if "status" in run_summary:
-        row["run_summary_status"] = run_summary.get("status")
+        actual_tokens = int(float(run_summary["actual_tokens"]))
+
+    row: dict[str, object] = {
+        "Method": DISPLAY_NAME[args.optimizer],
+        "Job ID": args.job_id,
+        "Actual tokens": actual_tokens,
+        "Requested budget": args.budget,
+        "Seed": args.seed,
+        "Tier": args.tier,
+        "Chosen step": best.get("chosen_step", np.nan),
+        "Eval rows": len(stage_eval(evals, args.budget)),
+        "Development nR2 proxy ↓": float(final_dev["dev_noisy_r2_proxy"]),
+        "Test nR2 proxy ↓": test_metrics["test_noisy_r2_proxy"],
+        "Development HV proxy ↑": float(final_dev["hv_dev_3d_proxy"]),
+        "Test HV proxy ↑": test_metrics["hv_test_3d_proxy"],
+        "nR2 Gap Proxy ↓": test_metrics["test_noisy_r2_proxy"]
+        - float(final_dev["dev_noisy_r2_proxy"]),
+        "Best Test Macro-F1 ↑": float(best["test_quality"]),
+        "Best Test Cost ↓": float(best["test_cost"]),
+        "Best Test Unfairness ↓": float(best["test_fairness"]),
+        "Test Max Abs TPR Gap ↓": best.get("test_max_abs_tpr_gap", np.nan),
+        "Test Fairness Ready": best.get("test_fairness_ready", np.nan),
+        "Logging dir": str(logdir),
+    }
 
     if pred_summary is not None and len(pred_summary):
         pred = pred_summary.iloc[0]
         for src, dst in [
-            ("eval_parquet_test_quality", "prediction_summary_eval_macro_f1"),
-            ("recomputed_macro_f1_raw", "recomputed_macro_f1_raw"),
-            ("recomputed_macro_f1_normalized", "recomputed_macro_f1_normalized"),
-            ("accuracy_raw", "accuracy_raw"),
-            ("accuracy_normalized", "accuracy_normalized"),
-            ("invalid_rate_raw", "invalid_rate_raw"),
-            ("invalid_rate_after_normalization", "invalid_rate_after_normalization"),
-            ("n_examples", "prediction_n_examples"),
+            ("recomputed_macro_f1_normalized", "Recomputed Macro-F1"),
+            ("accuracy_normalized", "Accuracy"),
+            ("invalid_rate_after_normalization", "Invalid Rate"),
+            ("n_examples", "Prediction Examples"),
         ]:
             if src in pred:
                 row[dst] = pred[src]
@@ -616,57 +823,31 @@ def build_summary_table(
     return pd.DataFrame([row])
 
 
-def write_readme(outdir: Path, args: argparse.Namespace, logging_dir: Path) -> None:
-    readme = f"""# Bias in Bios advanced compact run {args.job_id} curated figures
+def write_readme(outdir: Path, args: argparse.Namespace, logdir: Path) -> None:
+    text = f"""# Bias in Bios / Qwen-3-30B 2M curated MO-CAPO-style figures
 
 Generated by `analysis.make_bias_170287_figures`.
 
-## Run
+This folder follows the same visual style as `analysis.make_bias_1m_figures`, but
+it is for one temporary advanced run only, so nR2, HV, and Gap are proxy
+diagnostics rather than final multi-seed paper metrics.
 
-- Model: `{args.model}`
-- Dataset: `{args.dataset}`
-- Optimizer: `{args.optimizer}`
-- Seed: `{args.seed}`
-- Prompt tier: `{args.tier}`
-- Requested budget: `{args.budget}`
-- Logging directory: `{logging_dir}`
-- Prediction-capture directory: `{args.prediction_dir}`
+Run: job `{args.job_id}`, `{args.model}`, `{args.dataset}`, `{args.optimizer}`, seed `{args.seed}`, tier `{args.tier}`, budget `{args.budget}`.
 
-## Figures
+Logging directory: `{logdir}`.
 
-- `bias_170287_stepwise_incumbent_trajectory.*`  
-  Development-side incumbent Macro-F1, cost, and unfairness over token budget.
+Prediction-capture directory: `{args.prediction_dir}`.
 
-- `bias_170287_test_macro_f1_vs_cost.*`  
-  Holdout Test Macro-F1 vs cost for evaluated prompts at the 2M checkpoint.
-
-- `bias_170287_test_macro_f1_vs_unfairness.*`  
-  Holdout Test Macro-F1 vs unfairness for evaluated prompts at the 2M checkpoint.
-
-- `bias_170287_test_cost_vs_unfairness.*`  
-  Cost/fairness trade-off colored by Test Macro-F1.
-
-- `bias_170287_per_profession_f1.*`  
-  Per-profession F1 from prediction capture for the selected best prompt.
-
-- `bias_170287_confusion_hard_labels.*`  
-  Compact confusion matrix focused on the hardest / most-confused labels.
-
-## Tables
-
-- `bias_170287_summary.csv` and `.md`
-- `bias_170287_stepwise_incumbent_trajectory.csv`
-- `bias_170287_eval_rows.csv`
+Figures:
+- `bias_in_bios_qwen3_2m_nR2_trajectory_stepwise.*`
+- `bias_in_bios_qwen3_2m_hv_gap_trajectory_stepwise.*`
+- `bias_in_bios_qwen3_2m_attainment_macro_f1_cost.*`
+- `bias_in_bios_qwen3_2m_attainment_macro_f1_unfairness.*`
+- `bias_in_bios_qwen3_2m_trifair_fewshot_outputshare.*`
+- `bias_in_bios_qwen3_2m_trifair_fewshot_unfairness.*`
+- `bias_in_bios_qwen3_2m_confusion_hard_labels.*`
 """
-    (outdir / "README.md").write_text(readme, encoding="utf-8")
-
-
-def write_manifest(outdir: Path) -> None:
-    files = []
-    for path in sorted(outdir.iterdir()):
-        if path.is_file():
-            files.append({"file": path.name, "bytes": path.stat().st_size})
-    pd.DataFrame(files).to_csv(outdir / "manifest.csv", index=False)
+    (outdir / "README.md").write_text(text, encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -679,7 +860,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget", type=int, default=BUDGET)
     parser.add_argument("--tier", default=TIER)
     parser.add_argument("--results-root", default=DEFAULT_RESULTS_ROOT)
-    parser.add_argument("--prediction-dir", default=DEFAULT_PREDICTION_DIR)
+    parser.add_argument("--prediction-dir", default=DEFAULT_PRED_DIR)
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     parser.add_argument("--logging-dir", default="")
     return parser.parse_args()
@@ -692,40 +873,101 @@ def main() -> None:
     outdir = Path(args.out_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    logging_dir, step_results, evaluations, run_summary = load_run_files(args)
-    pred_dir = Path(args.prediction_dir)
-    pred_summary, per_prof, confusion = load_prediction_files(pred_dir)
+    logdir, step_results, evals, run_summary = load_run(args)
+    pred_summary, per_prof, confusion = load_prediction_outputs(Path(args.prediction_dir))
 
-    best = choose_best_eval_prompt(evaluations, args.budget)
-    stage = evaluation_stage(evaluations, args.budget)
+    step_metrics = build_step_metrics(step_results, evals)
+    summary = build_summary(
+        args=args,
+        logdir=logdir,
+        step_metrics=step_metrics,
+        evals=evals,
+        pred_summary=pred_summary,
+        run_summary=run_summary,
+    )
 
-    stepwise = prepare_stepwise_incumbents(step_results)
-    stepwise.to_csv(outdir / "bias_170287_stepwise_incumbent_trajectory.csv", index=False)
-    stage.to_csv(outdir / "bias_170287_eval_rows.csv", index=False)
+    step_metrics.to_csv(
+        outdir / "bias_in_bios_qwen3_2m_stepwise_dev_metrics.csv",
+        index=False,
+    )
+    stage_eval(evals, args.budget).to_csv(
+        outdir / "bias_in_bios_qwen3_2m_eval_rows.csv",
+        index=False,
+    )
+    summary.to_csv(
+        outdir / "bias_in_bios_qwen3_2m_summary_table.csv",
+        index=False,
+    )
 
-    summary = build_summary_table(args, logging_dir, evaluations, best, pred_summary, run_summary)
-    summary.to_csv(outdir / "bias_170287_summary.csv", index=False)
-    write_markdown_table(summary, outdir / "bias_170287_summary.md")
+    try:
+        (outdir / "bias_in_bios_qwen3_2m_summary_table.md").write_text(
+            summary.to_markdown(index=False, floatfmt=".6f") + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        (outdir / "bias_in_bios_qwen3_2m_summary_table.md").write_text(
+            summary.to_csv(index=False),
+            encoding="utf-8",
+        )
 
-    plot_stepwise_incumbent(stepwise, outdir)
-    plot_eval_macro_f1_vs_cost(evaluations, best, outdir, args.budget)
-    plot_eval_macro_f1_vs_unfairness(evaluations, best, outdir, args.budget)
-    plot_cost_vs_unfairness(evaluations, best, outdir, args.budget)
+    max_budget = int(max(args.budget, step_metrics["actual_budget_tokens"].max()))
+
+    plot_nR2(step_metrics, outdir, max_budget)
+    plot_hv_gap(step_metrics, summary, outdir, max_budget)
+
+    plot_attainment(
+        evals,
+        outdir,
+        "test_cost",
+        "Avg. Cost [$] per 1M Calls",
+        "bias_in_bios_qwen3_2m_attainment_macro_f1_cost",
+    )
+    plot_attainment(
+        evals,
+        outdir,
+        "test_fairness",
+        "Test Unfairness",
+        "bias_in_bios_qwen3_2m_attainment_macro_f1_unfairness",
+    )
+
+    plot_fewshot_scatter(
+        evals,
+        outdir,
+        "output_cost_share",
+        "Output Token Cost Share",
+        "bias_in_bios_qwen3_2m_trifair_fewshot_outputshare",
+    )
+    plot_fewshot_scatter(
+        evals,
+        outdir,
+        "test_fairness",
+        "Test Unfairness ↓",
+        "bias_in_bios_qwen3_2m_trifair_fewshot_unfairness",
+    )
 
     if per_prof is not None:
-        per_prof.to_csv(outdir / "bias_170287_per_profession_f1_source.csv", index=False)
-        plot_per_profession_f1(per_prof, outdir)
+        per_prof.to_csv(
+            outdir / "bias_in_bios_qwen3_2m_per_profession_f1_source.csv",
+            index=False,
+        )
 
     if confusion is not None:
-        confusion.to_csv(outdir / "bias_170287_confusion_source.csv")
-        plot_confusion_heatmap(confusion, per_prof, outdir)
+        confusion.to_csv(outdir / "bias_in_bios_qwen3_2m_confusion_source.csv")
+        plot_confusion(confusion, per_prof, outdir)
 
-    write_readme(outdir, args, logging_dir)
-    write_manifest(outdir)
+    write_readme(outdir, args, logdir)
 
-    print("\nBias 170287 curated figures written to:")
+    pd.DataFrame(
+        [
+            {"file": p.name, "bytes": p.stat().st_size}
+            for p in sorted(outdir.iterdir())
+            if p.is_file()
+        ]
+    ).to_csv(outdir / "manifest.csv", index=False)
+
+    print("\nCurated MO-CAPO-style Bias 170287 figures written to:")
     print(outdir.resolve())
-    print("\nSummary:")
+    print("\n2M summary table")
     print(summary.to_string(index=False))
 
 
