@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import importlib
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -156,13 +157,14 @@ class BiosLabelScorePredictor:
 
     def _make_sampling_params(self) -> Any:
         try:
-            from vllm import SamplingParams
+            vllm_module = importlib.import_module("vllm")
+            sampling_params_cls = getattr(vllm_module, "SamplingParams")
         except Exception as error:
             raise RuntimeError(
-                "vLLM is required for Bias label scoring. Run on the GPU cluster."
+                "vLLM is required for Bias label scoring. Run this mode on the Linux GPU cluster."
             ) from error
 
-        return SamplingParams(
+        return sampling_params_cls(
             temperature=0.0,
             max_tokens=1,
             prompt_logprobs=self.prompt_logprobs,
