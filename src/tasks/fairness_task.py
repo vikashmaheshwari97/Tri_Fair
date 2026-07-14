@@ -318,13 +318,6 @@ class FairnessTask(BaseTask):
                 **self.fairness_kwargs,
             )
 
-            input_counts = np.asarray(
-                [
-                    token_counter(f"{prompt_string}\n{self.xs[position]}")
-                    for position in positions
-                ],
-                dtype=float,
-            )
             # BasePredictor returns ``x + "\n" + raw_model_output``.  Remove
             # that exact prefix before tokenizing so output cost is not affected
             # by tokenizer boundary effects from subtracting two token counts.
@@ -336,10 +329,42 @@ class FairnessTask(BaseTask):
                     if str(sequence).startswith(prefix)
                     else str(sequence)
                 )
-            output_counts = np.asarray(
-                [token_counter(output) for output in raw_outputs],
-                dtype=float,
-            )
+
+            if hasattr(predictor, "token_usage"):
+                usage_rows = [
+                    predictor.token_usage(
+                        prompt_string,
+                        self.xs[position],
+                        raw_output=raw_output,
+                    )
+                    for position, raw_output in zip(positions, raw_outputs)
+                ]
+                input_counts = np.asarray(
+                    [
+                        float(row.get("input_tokens", token_counter(f"{prompt_string}\n{self.xs[position]}")))
+                        for row, position in zip(usage_rows, positions)
+                    ],
+                    dtype=float,
+                )
+                output_counts = np.asarray(
+                    [
+                        float(row.get("output_tokens", token_counter(raw_output)))
+                        for row, raw_output in zip(usage_rows, raw_outputs)
+                    ],
+                    dtype=float,
+                )
+            else:
+                input_counts = np.asarray(
+                    [
+                        token_counter(f"{prompt_string}\n{self.xs[position]}")
+                        for position in positions
+                    ],
+                    dtype=float,
+                )
+                output_counts = np.asarray(
+                    [token_counter(output) for output in raw_outputs],
+                    dtype=float,
+                )
 
             score_rows.append(scores)
             sequence_rows.append(sequences)

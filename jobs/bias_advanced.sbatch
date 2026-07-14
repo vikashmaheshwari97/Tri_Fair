@@ -29,6 +29,7 @@ OPTIMIZER="${OPTIMIZER:-Tri-Fair}"
 SEED="${SEED:-42}"
 BUDGET="${BUDGET:-250000}"
 BIOS_PROMPT_TIER="${BIOS_PROMPT_TIER:-compact}"
+PREDICTION_MODE="${PREDICTION_MODE:-marker}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 META_MAX_OUTPUT_TOKENS="${META_MAX_OUTPUT_TOKENS:-256}"
 N_INIT_PROMPTS="${N_INIT_PROMPTS:-6}"
@@ -50,6 +51,7 @@ echo "============================================================"
 echo "Bias advanced run"
 echo "model=$MODEL dataset=$DATASET optimizer=$OPTIMIZER seed=$SEED"
 echo "budget=$BUDGET tier=$BIOS_PROMPT_TIER"
+echo "prediction_mode=$PREDICTION_MODE"
 echo "output_root=$OUTPUT_ROOT"
 echo "output_dir=$OUTPUT_DIR"
 echo "run_id=$RUN_ID"
@@ -80,6 +82,7 @@ PY_CHECK
   --optimizer "$OPTIMIZER" \
   --n-init-prompts "$N_INIT_PROMPTS" \
   --max-output-tokens "$MAX_OUTPUT_TOKENS" \
+  --prediction-mode "$PREDICTION_MODE" \
   --meta-max-output-tokens "$META_MAX_OUTPUT_TOKENS" \
   --manifest-dir "$MANIFEST_DIR" \
   --max-steps "$MAX_STEPS"
@@ -127,6 +130,7 @@ echo "Evaluating chosen_step=$CHOSEN_STEP actual_tokens=$ACTUAL_TOKENS"
   --step "$CHOSEN_STEP" \
   --manifest-dir "$MANIFEST_DIR" \
   --max-output-tokens "$MAX_OUTPUT_TOKENS" \
+  --prediction-mode "$PREDICTION_MODE" \
   --force
 
 if [[ "$RUN_PRED_CAPTURE" == "1" ]]; then
@@ -139,6 +143,7 @@ if [[ "$RUN_PRED_CAPTURE" == "1" ]]; then
     --budget "$BUDGET" \
     --manifest-dir "$MANIFEST_DIR" \
     --max-output-tokens "$MAX_OUTPUT_TOKENS" \
+    --prediction-mode "$PREDICTION_MODE" \
     --logging-dir "$LOGGING_DIR" \
     --out-dir "$PRED_DIR"
 fi
