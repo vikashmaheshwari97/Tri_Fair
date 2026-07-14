@@ -16,6 +16,14 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 export FORCE_EVAL MANIFEST_DIR="${MANIFEST_DIR:-data/splits}" \
   MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
+NODELIST="${NODELIST:-firefly1,firefly2,firefly3,pegasus2}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
+PARTITION="${PARTITION:-}"
+QOS="${QOS:-}"
+ACCOUNT="${ACCOUNT:-}"
+GRES="${GRES:-}"
+TIME_LIMIT="${TIME_LIMIT:-}"
+MEMORY="${MEMORY:-}"
 
 tf_validate_positive_int BUDGET "$BUDGET"
 declare -a models datasets optimizers seeds
@@ -24,6 +32,16 @@ tf_split_csv "$TF_DATASETS" datasets
 tf_split_csv "$TF_OPTIMIZERS" optimizers
 tf_split_csv "$TF_SEEDS" seeds
 mkdir -p logs
+
+SBATCH_ARGS=(--parsable)
+[[ -n "${PARTITION:-}" ]] && SBATCH_ARGS+=("--partition=$PARTITION")
+[[ -n "${QOS:-}" ]] && SBATCH_ARGS+=("--qos=$QOS")
+[[ -n "${ACCOUNT:-}" ]] && SBATCH_ARGS+=("--account=$ACCOUNT")
+[[ -n "${GRES:-}" ]] && SBATCH_ARGS+=("--gres=$GRES")
+[[ -n "${TIME_LIMIT:-}" ]] && SBATCH_ARGS+=("--time=$TIME_LIMIT")
+[[ -n "${MEMORY:-}" ]] && SBATCH_ARGS+=("--mem=$MEMORY")
+[[ -n "${CPUS_PER_TASK:-}" ]] && SBATCH_ARGS+=("--cpus-per-task=$CPUS_PER_TASK")
+[[ -n "${NODELIST:-}" ]] && SBATCH_ARGS+=("--nodelist=$NODELIST")
 
 submitted=0
 skipped=0
@@ -44,7 +62,7 @@ for model in "${models[@]}"; do
           ((skipped+=1))
           continue
         fi
-        cmd=(sbatch --parsable jobs/run_eval.sbatch "$model" "$dataset" "$optimizer" "$seed" "$BUDGET")
+        cmd=(sbatch "${SBATCH_ARGS[@]}" jobs/run_eval.sbatch "$model" "$dataset" "$optimizer" "$seed" "$BUDGET")
         if tf_is_true "$DRY_RUN"; then
           printf 'DRY RUN:'; printf ' %q' "${cmd[@]}"; printf '\n'
         else

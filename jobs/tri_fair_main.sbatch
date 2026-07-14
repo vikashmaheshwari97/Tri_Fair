@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tri-fair
 #SBATCH --partition=gpu
-#SBATCH --nodelist=firefly1,firefly2,firefly3
+#SBATCH --nodelist=firefly1,firefly2,firefly3,pegasus2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32

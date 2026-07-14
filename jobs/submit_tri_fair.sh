@@ -25,6 +25,9 @@ export MAX_STEPS="${MAX_STEPS:-2000}"
 export FORCE_FRESH="${FORCE_FRESH:-0}"
 export DRY_RUN="${DRY_RUN:-0}"
 export ALLOW_PARTIAL_RESUME="${ALLOW_PARTIAL_RESUME:-0}"
+export NODELIST="${NODELIST:-firefly1,firefly2,firefly3,pegasus2}"
+export EVAL_NODELIST="${EVAL_NODELIST:-$NODELIST}"
+export CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
 
 case "$RUN_MODE" in
   auto|fresh|resume) ;;
