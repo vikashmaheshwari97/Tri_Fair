@@ -59,6 +59,17 @@ class BiosLabelScorePredictor:
             os.environ.get("BIOS_LABEL_SCORE_PROMPT_LOGPROBS", str(prompt_logprobs))
         )
 
+        # Promptolution optimizers use this attribute when they build meta-prompts
+        # for prompt mutation/crossover.  Prediction is still done by constrained
+        # label scoring; this text only tells the meta-optimizer what output
+        # format a good prompt should request.
+        self.extraction_description = (
+            "Extract exactly one Bias in Bios profession label. "
+            "The answer must be one of the allowed profession labels and should be "
+            "written as <final_answer>label</final_answer> with no explanation. "
+            "Allowed labels are: " + ", ".join(BIOS_ALLOWED_LABELS) + "."
+        )
+
         self.rerank_enabled = _env_bool("BIOS_LABEL_SCORE_RERANK", True)
         self.rerank_always_for_cluster = _env_bool(
             "BIOS_LABEL_SCORE_RERANK_ALWAYS_FOR_CLUSTER",
