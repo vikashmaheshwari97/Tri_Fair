@@ -1,19 +1,27 @@
 from __future__ import annotations
 
-import json
+import importlib
 import math
 import os
-import importlib
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from src.config.bios_prompt_guide import (
     BIOS_ALLOWED_LABELS,
     BIOS_LABEL_SET,
+    bios_confusion_cluster_for_labels,
     bios_label_completion,
     get_bios_label_completions,
+    get_bios_rerank_label_cues,
     validate_bios_label,
 )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().casefold() in {"1", "true", "yes", "y", "on"}
 
 
 @dataclass(frozen=True)
@@ -27,14 +35,7 @@ class BiosCandidateScore:
 
 
 class BiosLabelScorePredictor:
-    """Constrained Bias-in-Bios predictor based on label likelihood scoring.
-
-    For every biography, this predictor scores all 28 allowed profession labels
-    and returns the label with the best length-normalized log probability.
-
-    It implements the same minimal interface used by Promptolution predictors:
-      preds, sequences = predictor.predict(prompts=[...], xs=[...])
-    """
+    """Bias-in-Bios predictor using constrained label scoring plus cluster reranking."""
 
     def __init__(
         self,
@@ -58,6 +59,20 @@ class BiosLabelScorePredictor:
             os.environ.get("BIOS_LABEL_SCORE_PROMPT_LOGPROBS", str(prompt_logprobs))
         )
 
+        self.rerank_enabled = _env_bool("BIOS_LABEL_SCORE_RERANK", True)
+        self.rerank_always_for_cluster = _env_bool(
+            "BIOS_LABEL_SCORE_RERANK_ALWAYS_FOR_CLUSTER",
+            True,
+        )
+        self.rerank_margin = float(os.environ.get("BIOS_LABEL_SCORE_RERANK_MARGIN", "0.15"))
+        self.rerank_top_k = int(os.environ.get("BIOS_LABEL_SCORE_RERANK_TOP_K", "4"))
+        self.rerank_max_candidates = int(
+            os.environ.get("BIOS_LABEL_SCORE_RERANK_MAX_CANDIDATES", "8")
+        )
+        self.rerank_mix_weight = float(
+            os.environ.get("BIOS_LABEL_SCORE_RERANK_MIX_WEIGHT", "0.25")
+        )
+
         missing = set(BIOS_ALLOWED_LABELS) - set(self.classes)
         if missing:
             raise ValueError(
@@ -78,6 +93,7 @@ class BiosLabelScorePredictor:
         self._prior_cache: dict[str, dict[str, BiosCandidateScore]] = {}
         self._usage_cache: dict[tuple[str, str], dict[str, int]] = {}
         self._last_score_cache: dict[tuple[str, str], dict[str, float]] = {}
+        self._last_debug_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
         manual = getattr(self.llm, "_tri_fair_manual_token_count", None)
         if not isinstance(manual, dict):
@@ -101,9 +117,6 @@ class BiosLabelScorePredictor:
                 return list(self.tokenizer.encode(text))
         raise TypeError("Resolved tokenizer does not expose encode().")
 
-    def _token_count(self, text: str) -> int:
-        return len(self._encode(text))
-
     def _prediction_context(self, prompt: str, x: str) -> str:
         return f"{str(prompt).rstrip()}\n{str(x).strip()}\n"
 
@@ -111,6 +124,27 @@ class BiosLabelScorePredictor:
         return (
             f"{str(prompt).rstrip()}\n"
             "This person has a profession, but no job-specific evidence is provided.\n"
+        )
+
+    def _rerank_context(self, prompt: str, x: str, labels: Sequence[str]) -> str:
+        label_tuple = tuple(validate_bios_label(label) for label in labels)
+        cue_text = get_bios_rerank_label_cues(label_tuple)
+        return "\n\n".join(
+            [
+                str(prompt).rstrip(),
+                str(x).strip(),
+                "The first-stage label scorer found a close profession ambiguity.",
+                "Choose only from these candidate labels:\n" + ", ".join(label_tuple),
+                "Distinguishing evidence:\n" + cue_text,
+                (
+                    "Prefer the most specific supported profession over a generic label. "
+                    "For example, choose dentist for teeth/oral evidence, chiropractor "
+                    "for spine/back/manual-adjustment evidence, surgeon for operations, "
+                    "and nurse for RN/bedside nursing evidence."
+                ),
+                "Use biography evidence only. Do not use gender, names, or stereotypes.",
+                "Answer:",
+            ]
         )
 
     def _extract_logprob(self, entry: Any, token_id: int) -> float | None:
@@ -188,21 +222,25 @@ class BiosLabelScorePredictor:
             outputs.extend(chunk_outputs)
         return outputs
 
-    def _score_context(self, context: str) -> dict[str, BiosCandidateScore]:
-        labels = list(BIOS_ALLOWED_LABELS)
-        completions = [self.completions[label] for label in labels]
+    def _score_context(
+        self,
+        context: str,
+        labels: Sequence[str] | None = None,
+    ) -> dict[str, BiosCandidateScore]:
+        label_list = [validate_bios_label(label) for label in (labels or BIOS_ALLOWED_LABELS)]
+        completions = [self.completions[label] for label in label_list]
         full_texts = [context + completion for completion in completions]
 
         outputs = self._engine_generate(full_texts)
-        if len(outputs) != len(labels):
+        if len(outputs) != len(label_list):
             raise RuntimeError(
-                f"vLLM returned {len(outputs)} scoring outputs for {len(labels)} labels"
+                f"vLLM returned {len(outputs)} scoring outputs for {len(label_list)} labels"
             )
 
         scores: dict[str, BiosCandidateScore] = {}
 
         for label, completion, full_text, output in zip(
-            labels,
+            label_list,
             completions,
             full_texts,
             outputs,
@@ -245,55 +283,161 @@ class BiosLabelScorePredictor:
             self._prior_cache[prompt] = self._score_context(self._neutral_context(prompt))
         return self._prior_cache[prompt]
 
-    def _score_example(self, prompt: str, x: str) -> tuple[str, str, dict[str, int]]:
-        context = self._prediction_context(prompt, x)
-        scores = self._score_context(context)
+    def _apply_calibration(
+        self,
+        prompt: str,
+        scores: dict[str, BiosCandidateScore],
+    ) -> dict[str, BiosCandidateScore]:
+        if not self.calibrated:
+            return scores
 
-        if self.calibrated:
-            priors = self._prior_scores(prompt)
-            calibrated: dict[str, BiosCandidateScore] = {}
-            for label, score in scores.items():
-                prior = priors[label].raw_score
-                calibrated_score = score.raw_score - self.calibration_alpha * prior
-                calibrated[label] = BiosCandidateScore(
-                    label=score.label,
-                    completion=score.completion,
-                    raw_score=score.raw_score,
-                    calibrated_score=calibrated_score,
-                    input_tokens=score.input_tokens,
-                    completion_tokens=score.completion_tokens,
-                )
-            scores = calibrated
+        priors = self._prior_scores(prompt)
+        calibrated: dict[str, BiosCandidateScore] = {}
+        for label, score in scores.items():
+            prior = priors[label].raw_score
+            calibrated_score = score.raw_score - self.calibration_alpha * prior
+            calibrated[label] = BiosCandidateScore(
+                label=score.label,
+                completion=score.completion,
+                raw_score=score.raw_score,
+                calibrated_score=calibrated_score,
+                input_tokens=score.input_tokens,
+                completion_tokens=score.completion_tokens,
+            )
+        return calibrated
 
-        best = max(
+    def _ranked(self, scores: dict[str, BiosCandidateScore]) -> list[BiosCandidateScore]:
+        return sorted(
             scores.values(),
             key=lambda item: (
                 item.calibrated_score,
                 item.raw_score,
                 -BIOS_ALLOWED_LABELS.index(item.label),
             ),
+            reverse=True,
         )
 
+    def _select_rerank_labels(
+        self,
+        scores: dict[str, BiosCandidateScore],
+    ) -> tuple[str, ...]:
+        if not self.rerank_enabled:
+            return ()
+
+        ranked = self._ranked(scores)
+        if len(ranked) < 2:
+            return ()
+
+        top = ranked[0]
+        top_score = float(top.calibrated_score)
+
+        close_labels = [
+            item.label
+            for item in ranked[: max(2, self.rerank_top_k)]
+            if top_score - float(item.calibrated_score) <= self.rerank_margin
+        ]
+
+        top_has_cluster = len(bios_confusion_cluster_for_labels([top.label])) > 1
+        if len(close_labels) < 2 and not (
+            self.rerank_always_for_cluster and top_has_cluster
+        ):
+            return ()
+
+        seed_labels = close_labels or [item.label for item in ranked[: self.rerank_top_k]]
+        expanded = bios_confusion_cluster_for_labels(seed_labels)
+
+        ranked_position = {item.label: index for index, item in enumerate(ranked)}
+        expanded_sorted = sorted(
+            expanded,
+            key=lambda label: (
+                0 if label in ranked_position else 1,
+                ranked_position.get(label, len(BIOS_ALLOWED_LABELS)),
+                BIOS_ALLOWED_LABELS.index(label),
+            ),
+        )
+
+        selected = tuple(expanded_sorted[: max(2, self.rerank_max_candidates)])
+        return selected if len(selected) >= 2 else ()
+
+    def _combine_rerank_scores(
+        self,
+        first_scores: dict[str, BiosCandidateScore],
+        rerank_scores: dict[str, BiosCandidateScore],
+    ) -> dict[str, BiosCandidateScore]:
+        combined: dict[str, BiosCandidateScore] = {}
+        for label, score in rerank_scores.items():
+            first = first_scores[label]
+            mixed = (
+                float(score.calibrated_score)
+                + self.rerank_mix_weight * float(first.calibrated_score)
+            )
+            combined[label] = BiosCandidateScore(
+                label=score.label,
+                completion=score.completion,
+                raw_score=score.raw_score,
+                calibrated_score=mixed,
+                input_tokens=score.input_tokens,
+                completion_tokens=score.completion_tokens,
+            )
+        return combined
+
+    def _score_example(self, prompt: str, x: str) -> tuple[str, str, dict[str, int]]:
+        context = self._prediction_context(prompt, x)
+        first_scores = self._score_context(context)
+        first_scores = self._apply_calibration(prompt, first_scores)
+        first_ranked = self._ranked(first_scores)
+
+        input_tokens = int(sum(score.input_tokens for score in first_scores.values()))
+        output_tokens = int(len(first_scores))
+        candidate_count = int(len(first_scores))
+        rerank_used = False
+        rerank_labels: tuple[str, ...] = ()
+        final_scores = first_scores
+
+        rerank_labels = self._select_rerank_labels(first_scores)
+        if rerank_labels:
+            rerank_context = self._rerank_context(prompt, x, rerank_labels)
+            rerank_scores = self._score_context(rerank_context, labels=rerank_labels)
+            rerank_scores = self._apply_calibration(prompt, rerank_scores)
+            final_scores = self._combine_rerank_scores(first_scores, rerank_scores)
+
+            input_tokens += int(sum(score.input_tokens for score in rerank_scores.values()))
+            output_tokens += int(len(rerank_scores))
+            candidate_count += int(len(rerank_scores))
+            rerank_used = True
+
+        best = self._ranked(final_scores)[0]
         predicted_label = validate_bios_label(best.label)
         completion = bios_label_completion(predicted_label)
         sequence = f"{x}\n{completion}"
 
-        input_tokens = int(sum(score.input_tokens for score in scores.values()))
-        output_tokens = int(best.completion_tokens)
-
         usage = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "candidate_count": len(scores),
+            "candidate_count": candidate_count,
+            "rerank_used": int(rerank_used),
+            "rerank_candidate_count": len(rerank_labels),
         }
 
-        self._usage_cache[(str(prompt), str(x))] = usage
-        self._last_score_cache[(str(prompt), str(x))] = {
-            label: float(score.calibrated_score) for label, score in scores.items()
+        cache_key = (str(prompt), str(x))
+        self._usage_cache[cache_key] = usage
+        self._last_score_cache[cache_key] = {
+            label: float(score.calibrated_score) for label, score in final_scores.items()
+        }
+        self._last_debug_cache[cache_key] = {
+            "first_stage_top": first_ranked[0].label,
+            "first_stage_top_score": float(first_ranked[0].calibrated_score),
+            "final_top": predicted_label,
+            "rerank_used": bool(rerank_used),
+            "rerank_labels": list(rerank_labels),
         }
 
-        self._manual_counts["input_tokens"] = int(self._manual_counts.get("input_tokens", 0)) + input_tokens
-        self._manual_counts["output_tokens"] = int(self._manual_counts.get("output_tokens", 0)) + output_tokens
+        self._manual_counts["input_tokens"] = (
+            int(self._manual_counts.get("input_tokens", 0)) + input_tokens
+        )
+        self._manual_counts["output_tokens"] = (
+            int(self._manual_counts.get("output_tokens", 0)) + output_tokens
+        )
 
         return predicted_label, sequence, usage
 
@@ -307,12 +451,21 @@ class BiosLabelScorePredictor:
         return dict(
             self._usage_cache.get(
                 (str(prompt), str(x)),
-                {"input_tokens": 0, "output_tokens": 0, "candidate_count": 0},
+                {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "candidate_count": 0,
+                    "rerank_used": 0,
+                    "rerank_candidate_count": 0,
+                },
             )
         )
 
     def label_scores(self, prompt: str, x: str) -> dict[str, float]:
         return dict(self._last_score_cache.get((str(prompt), str(x)), {}))
+
+    def label_debug(self, prompt: str, x: str) -> dict[str, Any]:
+        return dict(self._last_debug_cache.get((str(prompt), str(x)), {}))
 
     def predict(
         self,
@@ -321,7 +474,6 @@ class BiosLabelScorePredictor:
         system_prompts: Any = None,
     ) -> tuple[list[str], list[str]]:
         if system_prompts is not None:
-            # Current project does not use system prompts for these fairness tasks.
             pass
 
         if len(prompts) != len(xs):

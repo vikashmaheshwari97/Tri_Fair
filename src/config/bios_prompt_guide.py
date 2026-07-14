@@ -221,6 +221,48 @@ BIOS_CONFUSION_CLUSTERS = {
 }
 
 
+
+BIOS_RERANK_LABEL_CUES = {
+    "accountant": "accounting, audits, taxes, bookkeeping, financial records, budgets, payroll.",
+    "architect": "building design, architecture firms, blueprints, construction drawings, spatial plans.",
+    "attorney": "lawyer, counsel, court representation, legal advice, prosecution, defense, legal practice.",
+    "chiropractor": "spine, back pain, neck pain, musculoskeletal care, chiropractic adjustment, manual manipulation.",
+    "comedian": "stand-up comedy, comic performance, sketches, humorous stage work, comedy writing.",
+    "composer": "writes music, scores, orchestral works, arrangements, compositions, music notation.",
+    "dentist": "teeth, gums, oral health, dental clinic, dental surgery, cavities, orthodontic or dental care.",
+    "dietitian": "nutrition, diet plans, meal planning, clinical nutrition, food-based health counseling.",
+    "dj": "mixes or plays recorded music, club sets, radio sets, turntables, live DJ performances.",
+    "filmmaker": "film, video, documentary, directing, producing, editing, cinema projects.",
+    "interior_designer": "indoor spaces, decor, furnishings, room layout, residential or commercial interiors.",
+    "journalist": "news reporting, articles, editing, interviews, current events, newspapers, broadcasting.",
+    "model": "fashion modeling, advertising shoots, posing, runway, visual modeling.",
+    "nurse": "RN, nursing duties, bedside care, patient-care support, hospital shifts, administering care.",
+    "painter": "paint, canvas, murals, studio art, exhibitions, visual artwork using paint.",
+    "paralegal": "legal assistant, law-office support, case files, drafts legal documents, assists lawyers.",
+    "pastor": "minister, preacher, clergy, church leadership, congregation, sermons, religious services.",
+    "personal_trainer": "fitness coaching, workouts, exercise plans, gym clients, strength or conditioning training.",
+    "photographer": "still photographs, photo shoots, camera work, portraits, events, professional photography.",
+    "physician": "medical doctor diagnosing and treating patients, clinic or hospital medicine, general patient treatment.",
+    "poet": "poems, poetry readings, verse, poetry publications, literary poetry work.",
+    "professor": "university or college faculty, academic research, lectures, publications, supervising students.",
+    "psychologist": "therapy, mental health, behavior, psychological assessment, counseling, research in psychology.",
+    "rapper": "rap, hip-hop performance, lyrics, MC, rap albums, rap concerts.",
+    "software_engineer": "programming, code, software systems, apps, backend, frontend, production services.",
+    "surgeon": "operations, operating room, surgical procedures, performs surgery, surgical patients.",
+    "teacher": "school classroom, lessons, children or pupils, primary or secondary education.",
+    "yoga_teacher": "yoga classes, poses, breathing, meditation, yoga instruction.",
+}
+
+
+def get_bios_rerank_label_cues(labels: Sequence[str]) -> str:
+    normalized = [validate_bios_label(label) for label in labels]
+    return "\n".join(
+        f"- {label}: {BIOS_RERANK_LABEL_CUES.get(label, label.replace('_', ' '))}"
+        for label in normalized
+    )
+
+
+
 def _bullets(lines: Iterable[str]) -> str:
     return "\n".join(f"- {line}" for line in lines)
 
@@ -388,6 +430,8 @@ def get_bios_pairwise_rerank_context(
             "Biography:\n" + str(biography).strip(),
             "The first-stage scorer found a close decision.",
             "Now choose only from these candidate labels:\n" + ", ".join(labels),
+            "Distinguishing evidence:\n" + get_bios_rerank_label_cues(labels),
+            "Prefer the most specific supported profession over a generic label.",
             "Use biography evidence only. Do not use stereotypes.",
             "Answer:",
         ]
