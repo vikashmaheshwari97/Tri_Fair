@@ -37,7 +37,6 @@ from typing import Any
 from promptolution.optimizers import CAPO, EvoPromptGA
 from promptolution.optimizers.base_optimizer import BaseOptimizer
 from promptolution.predictors import MarkerBasedPredictor
-from src.predictors import PREDICTION_MODES, create_predictor
 from promptolution.utils import LoggerCallback
 from promptolution.utils.callbacks import TokenCountCallback
 from promptolution.utils.templates import EVOPROMPT_GA_TEMPLATE
@@ -103,12 +102,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--n-init-prompts", type=int, default=6)
     parser.add_argument("--max-output-tokens", type=int, default=16)
-    parser.add_argument(
-        "--prediction-mode",
-        choices=PREDICTION_MODES,
-        default="marker",
-        help="Prediction mechanism for downstream evaluation. Use bios_label_score only for Bias in Bios.",
-    )
     parser.add_argument("--meta-max-output-tokens", type=int, default=256)
     parser.add_argument(
         "--budget-checkpoints",
@@ -159,9 +152,6 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.input_cost_multiplier < 0 or args.output_cost_multiplier < 0:
         raise ValueError("Cost multipliers cannot be negative")
 
-    if str(args.prediction_mode).startswith("bios_label_score") and args.dataset != "bias_in_bios":
-        raise ValueError("--prediction-mode=bios_label_score is only valid for bias_in_bios")
-
 
 def _resolve_logging_dir(args: argparse.Namespace) -> Path:
     if args.resume_from:
@@ -201,7 +191,6 @@ def _validate_resume_metadata(logging_dir: Path, args: argparse.Namespace) -> No
             "manifest_dir",
             "max_output_tokens",
             "meta_max_output_tokens",
-            "prediction_mode",
             "input_cost_multiplier",
             "output_cost_multiplier",
             "crossovers_per_iteration",
@@ -387,12 +376,7 @@ def run(args: argparse.Namespace, *, logging_dir: Path | None = None) -> Path:
         list(dataset_config.initial_prompts),
         args.n_init_prompts,
     )
-    predictor = create_predictor(
-        args.prediction_mode,
-        downstream_llm,
-        dev_task.classes,
-        dataset=args.dataset,
-    )
+    predictor = MarkerBasedPredictor(downstream_llm, dev_task.classes)
 
     callbacks = [
         LoggerCallback(LOGGER),

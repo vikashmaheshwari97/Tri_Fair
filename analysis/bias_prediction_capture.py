@@ -13,7 +13,6 @@ from sklearn.metrics import (
 )
 
 from promptolution.predictors import MarkerBasedPredictor
-from src.predictors import PREDICTION_MODES, create_predictor
 
 from scripts._common import set_generation_limit
 from src.config.dataset_configs import ALL_DATASETS
@@ -121,12 +120,7 @@ def run_one(args: argparse.Namespace) -> None:
 
     llm = create_llm(model_config=model_config, seed=args.seed)
     set_generation_limit(llm, args.max_output_tokens)
-    predictor = create_predictor(
-        args.prediction_mode,
-        llm,
-        test_task.classes,
-        dataset=args.dataset,
-    )
+    predictor = MarkerBasedPredictor(llm, test_task.classes)
 
     df = test_task.df.reset_index(drop=True).copy()
     xs = df["input"].astype(str).tolist()
@@ -359,12 +353,6 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=1_000_000)
     parser.add_argument("--manifest-dir", default="data/splits")
     parser.add_argument("--max-output-tokens", type=int, default=16)
-    parser.add_argument(
-        "--prediction-mode",
-        choices=PREDICTION_MODES,
-        default="marker",
-        help="Prediction mechanism for recomputing the best prompt.",
-    )
     parser.add_argument("--out-dir", default="analysis/output/bias_prediction_capture")
     parser.add_argument("--results-root", default="results/tri_fair")
     parser.add_argument(

@@ -215,22 +215,15 @@ def set_generation_limit(llm: Any, max_tokens: int) -> None:
 
 
 def token_counts(llm: Any) -> dict[str, int]:
-    manual = getattr(llm, "_tri_fair_manual_token_count", None)
-    manual_input = int(manual.get("input_tokens", 0)) if isinstance(manual, dict) else 0
-    manual_output = int(manual.get("output_tokens", 0)) if isinstance(manual, dict) else 0
-
     if hasattr(llm, "get_token_count"):
         raw = llm.get_token_count()
-        input_tokens = int(raw.get("input_tokens", 0)) + manual_input
-        output_tokens = int(raw.get("output_tokens", 0)) + manual_output
         return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
+            "input_tokens": int(raw.get("input_tokens", 0)),
+            "output_tokens": int(raw.get("output_tokens", 0)),
+            "total_tokens": int(raw.get("total_tokens", 0)),
         }
-
-    input_tokens = int(getattr(llm, "input_token_count", 0)) + manual_input
-    output_tokens = int(getattr(llm, "output_token_count", 0)) + manual_output
+    input_tokens = int(getattr(llm, "input_token_count", 0))
+    output_tokens = int(getattr(llm, "output_token_count", 0))
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,

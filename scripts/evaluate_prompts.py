@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pandas as pd
 from promptolution.predictors import MarkerBasedPredictor
-from src.predictors import PREDICTION_MODES, create_predictor
 
 from src.config.dataset_configs import ALL_DATASETS
 from src.config.model_configs import ALL_MODELS
@@ -80,12 +79,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--regenerate-manifest", action="store_true")
     parser.add_argument("--manifest-lock-timeout", type=float, default=3600.0)
     parser.add_argument("--max-output-tokens", type=int, default=16)
-    parser.add_argument(
-        "--prediction-mode",
-        choices=PREDICTION_MODES,
-        default="marker",
-        help="Prediction mechanism for holdout evaluation.",
-    )
     parser.add_argument("--output-file", default="eval.parquet")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--log-level", default="INFO")
@@ -253,12 +246,7 @@ def run(args: argparse.Namespace) -> Path:
         )
 
     prompts = reconstruct_prompts(pending)
-    predictor = create_predictor(
-        args.prediction_mode,
-        llm,
-        test_task.classes,
-        dataset=args.dataset,
-    )
+    predictor = MarkerBasedPredictor(llm, test_task.classes)
     result = test_task.evaluate(
         prompts=prompts,
         predictor=predictor,
