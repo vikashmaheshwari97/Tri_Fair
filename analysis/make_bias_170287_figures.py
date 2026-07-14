@@ -1,8 +1,9 @@
 """MO-CAPO-style curated figures for advanced Bias in Bios 1M runs.
 
-This replaces the old single-job 170287 diagnostic script.  It summarizes the
-prompt-only advanced Bias setup across multiple optimizers and seeds, using the
-same result layout produced by jobs/bias_advanced.sbatch.
+This script keeps the same figure style and file naming used by
+``analysis/make_bias_1m_figures.py`` for the original 49% Bias figures, but it
+loads the prompt-only advanced Bias runs directly from ``jobs/bias_advanced.sbatch``
+output directories instead of ``analysis/output/run_metrics.csv``.
 
 Default input root:
   results/tri_fair_bias_high_macro_f1/compact_full_1m
@@ -12,6 +13,14 @@ Expected runs:
 
 Output:
   analysis/output/curated_figures_bias_advanced_1m_mocapo_style
+
+Figures generated:
+  1. Stepwise development nR2-proxy trajectory.
+  2. Stepwise development HV trajectory plus 1M holdout gap proxy.
+  3. 1M empirical-attainment-style Test Macro-F1 vs Cost.
+  4. 1M empirical-attainment-style Test Macro-F1 vs Test Unfairness.
+  5. Tri-Fair-only final incumbent plot colored by output-token cost share.
+  6. Tri-Fair-only final incumbent plot colored by test unfairness.
 """
 
 from __future__ import annotations
@@ -34,42 +43,46 @@ import pandas as pd
 
 MODEL = "qwen-3-30b"
 DATASET = "bias_in_bios"
-BUDGET = 1_000_000
+FINAL_BUDGET = 1_000_000
 TIER = "compact"
-DEFAULT_RESULTS_ROOT = "results/tri_fair_bias_high_macro_f1/compact_full_1m"
-DEFAULT_PREDICTION_ROOT = "analysis/output/bias_advanced_prediction_capture"
-DEFAULT_OUT_DIR = "analysis/output/curated_figures_bias_advanced_1m_mocapo_style"
-DEFAULT_OPTIMIZERS = ("Tri-Fair", "NSGAII-PO-Fair")
-DEFAULT_SEEDS = (42, 43, 44)
-
 N_PREFERENCES = 500
 PREFERENCE_SEED = 2026
+
+# Qwen3-30B weights used by the experiment cost objective.
+# Cost = 0.11 * input_tokens + 0.41 * output_tokens.
 QWEN_INPUT_WEIGHT = 0.11
 QWEN_OUTPUT_WEIGHT = 0.41
 
+OPTIMIZER_ORDER = ["Tri-Fair", "NSGAII-PO-Fair"]
 DISPLAY_NAME = {
     "Tri-Fair": "Tri-Fair",
-    "NSGAII-PO-Fair": "NSGAII-PO-Fair",
+    "NSGAII-PO-Fair": "NSGA-II-PO-Fair",
 }
 COLORS = {
     "Tri-Fair": "black",
-    "NSGAII-PO-Fair": "tab:blue",
+    "NSGAII-PO-Fair": "#E69F00",
 }
 MARKERS = {
     "Tri-Fair": "o",
     "NSGAII-PO-Fair": "s",
 }
 
+DEFAULT_RESULTS_ROOT = "results/tri_fair_bias_high_macro_f1/compact_full_1m"
+DEFAULT_OUT_DIR = "analysis/output/curated_figures_bias_advanced_1m_mocapo_style"
+
 
 @dataclass(frozen=True)
-class Bounds:
+class CostBounds:
+    """Simple normalization bounds for development-side stepwise metrics."""
+
     cost_max: float
 
-    def normalize(self, raw_minimize: np.ndarray) -> np.ndarray:
-        out = raw_minimize.astype(float).copy()
-        out[:, 0] = np.clip(out[:, 0], 0.0, 1.0)  # 1 - quality
+    def normalize_minimize(self, raw: np.ndarray) -> np.ndarray:
+        """Normalize minimize-all objectives [1-macro_f1, cost, unfairness]."""
+        out = raw.astype(float).copy()
+        out[:, 0] = np.clip(out[:, 0], 0.0, 1.0)
         out[:, 1] = np.clip(out[:, 1] / self.cost_max, 0.0, 1.1)
-        out[:, 2] = np.clip(out[:, 2], 0.0, 1.0)  # unfairness
+        out[:, 2] = np.clip(out[:, 2], 0.0, 1.0)
         return out
 
 
@@ -77,13 +90,12 @@ class Bounds:
 class RunData:
     optimizer: str
     seed: int
+    run_key: str
     output_dir: Path
     logging_dir: Path
     step_results: pd.DataFrame
-    evals: pd.DataFrame
+    evaluations: pd.DataFrame
     run_summary: dict[str, object]
-    pred_summary: pd.DataFrame | None = None
-    per_profession: pd.DataFrame | None = None
 
 
 def configure_style() -> None:
@@ -103,30 +115,14 @@ def configure_style() -> None:
     )
 
 
-def num(s: pd.Series) -> np.ndarray:
-    return pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+def output_dir(args: argparse.Namespace) -> Path:
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
-def save(fig: plt.Figure, outdir: Path, stem: str) -> None:
-    fig.savefig(outdir / f"{stem}.pdf", bbox_inches="tight")
-    fig.savefig(outdir / f"{stem}.png", bbox_inches="tight")
-    plt.close(fig)
-
-
-def require(df: pd.DataFrame, columns: Iterable[str], name: str) -> None:
-    missing = [c for c in columns if c not in df.columns]
-    if missing:
-        raise ValueError(f"{name} is missing required columns: {missing}")
-
-
-def read_json(path: Path) -> dict[str, object]:
-    if not path.is_file():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # pragma: no cover - diagnostic warning only
-        warnings.warn(f"Could not parse {path}: {exc}")
-        return {}
+def finite_numeric(series: pd.Series) -> np.ndarray:
+    return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
 
 
 def split_csv(raw: str, *, cast=str) -> list:
@@ -138,8 +134,14 @@ def split_csv(raw: str, *, cast=str) -> list:
     return out
 
 
-def safe_name(value: str) -> str:
-    return value.replace("-", "_").replace("/", "_")
+def read_json(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warnings.warn(f"Could not parse {path}: {exc}")
+        return {}
 
 
 def resolve_output_dir(args: argparse.Namespace, optimizer: str, seed: int) -> Path:
@@ -159,98 +161,111 @@ def resolve_logging_dir(output_dir: Path) -> Path:
         raise FileNotFoundError(f"Missing logging_dir.txt: {pointer}")
     raw = pointer.read_text(encoding="utf-8").strip()
     path = Path(raw).expanduser()
-    path = path if path.is_absolute() else pointer.parent / path
+    if not path.is_absolute():
+        path = pointer.parent / path
     path = path.resolve()
     if not path.is_dir():
         raise FileNotFoundError(f"Resolved logging directory does not exist: {path}")
     return path
 
 
-def stage_eval(evals: pd.DataFrame, budget: int) -> pd.DataFrame:
-    out = evals.copy()
-    if "budget_checkpoint" in out:
-        stage = out[out["budget_checkpoint"] == budget].copy()
-        if not stage.empty:
-            out = stage
-    if "test_fairness_ready" in out:
-        ready = out["test_fairness_ready"].fillna(False).astype(bool)
-        if ready.any():
-            out = out[ready].copy()
-    return out.reset_index(drop=True)
+def load_run(args: argparse.Namespace, optimizer: str, seed: int) -> RunData:
+    output = resolve_output_dir(args, optimizer, seed)
+    logging_dir = resolve_logging_dir(output)
+    step_path = logging_dir / "step_results.parquet"
+    eval_path = logging_dir / "eval.parquet"
 
+    if not step_path.is_file():
+        raise FileNotFoundError(step_path)
+    if not eval_path.is_file():
+        raise FileNotFoundError(eval_path)
 
-def step_tokens(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-    out = df.copy()
-    if "total_tokens_downstream" in out:
-        return out, "total_tokens_downstream"
-    if "actual_budget_tokens" in out:
-        return out, "actual_budget_tokens"
-    if {"input_tokens_downstream", "output_tokens_downstream"}.issubset(out.columns):
-        out["_total_tokens"] = num(out["input_tokens_downstream"]) + num(
-            out["output_tokens_downstream"]
-        )
-        return out, "_total_tokens"
-    raise ValueError(
-        "step_results needs total_tokens_downstream or input/output token columns"
+    run_key = f"{args.model}/{args.dataset}/{optimizer}/seed{seed}/budget{args.budget}"
+    return RunData(
+        optimizer=optimizer,
+        seed=int(seed),
+        run_key=run_key,
+        output_dir=output,
+        logging_dir=logging_dir,
+        step_results=pd.read_parquet(step_path),
+        evaluations=pd.read_parquet(eval_path),
+        run_summary=read_json(logging_dir / "run_summary.json"),
     )
 
 
-def step_objectives(df: pd.DataFrame) -> np.ndarray:
-    return np.column_stack(
-        [
-            1.0 - num(df["quality"]),
-            num(df["cost"]),
-            num(df["fairness"]),
-        ]
-    )
+def load_runs(args: argparse.Namespace) -> list[RunData]:
+    optimizers = split_csv(args.optimizers, cast=str)
+    seeds = split_csv(args.seeds, cast=int)
+    runs: list[RunData] = []
+    missing: list[str] = []
 
+    for optimizer in optimizers:
+        for seed in seeds:
+            try:
+                runs.append(load_run(args, optimizer, seed))
+            except Exception as exc:
+                label = f"{optimizer} seed{seed}: {exc}"
+                if args.allow_missing:
+                    warnings.warn(label)
+                else:
+                    missing.append(label)
 
-def eval_objectives(df: pd.DataFrame) -> np.ndarray:
-    return np.column_stack(
-        [
-            1.0 - num(df["test_quality"]),
-            num(df["test_cost"]),
-            num(df["test_fairness"]),
-        ]
-    )
+    if missing:
+        raise FileNotFoundError("Missing required runs:\n  - " + "\n  - ".join(missing))
+    if not runs:
+        raise RuntimeError("No runs could be loaded")
+    return runs
 
 
 def pareto_mask_minimize(values: np.ndarray) -> np.ndarray:
+    """Return non-dominated mask for minimization objective matrix."""
     values = np.asarray(values, dtype=float)
     if len(values) == 0:
         return np.zeros(0, dtype=bool)
+
     keep = np.ones(len(values), dtype=bool)
     for i in range(len(values)):
-        dominates = np.all(values <= values[i], axis=1) & np.any(values < values[i], axis=1)
-        dominates[i] = False
-        keep[i] = not np.any(dominates)
+        dominates_i = np.all(values <= values[i], axis=1) & np.any(values < values[i], axis=1)
+        dominates_i[i] = False
+        if np.any(dominates_i):
+            keep[i] = False
     return keep
 
 
-def preferences() -> np.ndarray:
-    return np.random.default_rng(PREFERENCE_SEED).dirichlet(np.ones(3), size=N_PREFERENCES)
+def make_preferences(n_preferences: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.dirichlet(np.ones(3), size=n_preferences)
 
 
-def r2(front: np.ndarray) -> float:
-    if len(front) == 0:
+def chebyshev_r2(normalized_minimize_front: np.ndarray, weights: np.ndarray) -> float:
+    """Lower is better. Development-side proxy for nR2/R2-style utility."""
+    if len(normalized_minimize_front) == 0:
         return float("nan")
-    weights = preferences()
+
+    front = np.asarray(normalized_minimize_front, dtype=float)
     utilities = np.max(weights[:, None, :] * front[None, :, :], axis=2)
-    return float(np.mean(np.min(utilities, axis=1)))
+    chosen = np.min(utilities, axis=1)
+    return float(np.mean(chosen))
 
 
-def hv3(front: np.ndarray, ref: tuple[float, float, float] = (1.05, 1.05, 1.05)) -> float:
+def hypervolume_3d(
+    normalized_minimize_front: np.ndarray,
+    ref: tuple[float, float, float] = (1.05, 1.05, 1.05),
+) -> float:
     """Exact grid-sweep hypervolume for small normalized 3D minimization fronts."""
-    points = np.asarray(front, dtype=float)
+    points = np.asarray(normalized_minimize_front, dtype=float)
     if points.size == 0:
         return 0.0
+
     ref_arr = np.asarray(ref, dtype=float)
     points = points[np.all(np.isfinite(points), axis=1)]
     points = points[np.all(points <= ref_arr, axis=1)]
     if len(points) == 0:
         return 0.0
+
     points = points[pareto_mask_minimize(points)]
     coords = [np.sort(np.unique(np.r_[points[:, d], ref_arr[d]])) for d in range(3)]
+
     hv = 0.0
     for i in range(len(coords[0]) - 1):
         for j in range(len(coords[1]) - 1):
@@ -265,188 +280,204 @@ def hv3(front: np.ndarray, ref: tuple[float, float, float] = (1.05, 1.05, 1.05))
     return hv
 
 
-def infer_global_bounds(runs: Sequence[RunData]) -> Bounds:
-    vals: list[float] = []
-    for run in runs:
-        if "cost" in run.step_results:
-            arr = num(run.step_results["cost"])
-            if np.isfinite(arr).any():
-                vals.append(float(np.nanmax(arr)))
-        for col in ["test_cost", "dev_cost", "cost"]:
-            if col in run.evals:
-                arr = num(run.evals[col])
-                if np.isfinite(arr).any():
-                    vals.append(float(np.nanmax(arr)))
-    finite = [v for v in vals if np.isfinite(v)]
-    return Bounds(cost_max=max((max(finite) if finite else 1.0) * 1.05, 1.0))
-
-
-def prediction_candidates(root: Path, optimizer: str, seed: int) -> list[Path]:
-    safe = safe_name(optimizer)
-    patterns = [
-        f"**/summary_{safe}_seed{seed}.csv",
-        "**/bias_in_bios_best_prompt_prediction_summary.csv",
-    ]
-    paths: list[Path] = []
-    for pattern in patterns:
-        paths.extend(root.glob(pattern))
-    return sorted(set(paths), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-
-
-def read_matching_summary(path: Path, optimizer: str, seed: int) -> pd.DataFrame | None:
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return None
-    if df.empty:
-        return None
-    if "optimizer" in df.columns:
-        df = df[df["optimizer"].astype(str) == optimizer]
-    if "seed" in df.columns:
-        df = df[pd.to_numeric(df["seed"], errors="coerce").astype("Int64") == int(seed)]
-    return df.reset_index(drop=True) if not df.empty else None
-
-
-def load_prediction_summary(args: argparse.Namespace, optimizer: str, seed: int) -> pd.DataFrame | None:
-    root = Path(args.prediction_root)
-    if not root.exists():
-        return None
-    for path in prediction_candidates(root, optimizer, seed):
-        match = read_matching_summary(path, optimizer, seed)
-        if match is not None:
-            return match
-    return None
-
-
-def load_per_profession(args: argparse.Namespace, optimizer: str, seed: int) -> pd.DataFrame | None:
-    root = Path(args.prediction_root)
-    if not root.exists():
-        return None
-    safe = safe_name(optimizer)
-    candidates = sorted(
-        root.glob(f"**/per_profession_f1_{safe}_seed{seed}.csv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for path in candidates:
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            continue
-        if not df.empty:
-            return df
-    return None
-
-
-def load_run(args: argparse.Namespace, optimizer: str, seed: int) -> RunData:
-    output_dir = resolve_output_dir(args, optimizer, seed)
-    logging_dir = resolve_logging_dir(output_dir)
-    step_path = logging_dir / "step_results.parquet"
-    eval_path = logging_dir / "eval.parquet"
-    if not step_path.is_file():
-        raise FileNotFoundError(step_path)
-    if not eval_path.is_file():
-        raise FileNotFoundError(eval_path)
-    return RunData(
-        optimizer=optimizer,
-        seed=seed,
-        output_dir=output_dir,
-        logging_dir=logging_dir,
-        step_results=pd.read_parquet(step_path),
-        evals=pd.read_parquet(eval_path),
-        run_summary=read_json(logging_dir / "run_summary.json"),
-        pred_summary=load_prediction_summary(args, optimizer, seed),
-        per_profession=load_per_profession(args, optimizer, seed),
+def step_tokens(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    out = df.copy()
+    if "total_tokens_downstream" in out:
+        return out, "total_tokens_downstream"
+    if "actual_budget_tokens" in out:
+        return out, "actual_budget_tokens"
+    if {"input_tokens_downstream", "output_tokens_downstream"}.issubset(out.columns):
+        out["_total_tokens"] = finite_numeric(out["input_tokens_downstream"]) + finite_numeric(
+            out["output_tokens_downstream"]
+        )
+        return out, "_total_tokens"
+    raise ValueError(
+        "step_results needs total_tokens_downstream or input/output token columns"
     )
 
 
-def load_runs(args: argparse.Namespace) -> list[RunData]:
-    optimizers = split_csv(args.optimizers, cast=str)
-    seeds = split_csv(args.seeds, cast=int)
-    runs: list[RunData] = []
-    missing: list[str] = []
-    for optimizer in optimizers:
-        for seed in seeds:
-            try:
-                runs.append(load_run(args, optimizer, seed))
-            except Exception as exc:
-                label = f"{optimizer} seed{seed}: {exc}"
-                if args.allow_missing:
-                    warnings.warn(label)
-                else:
-                    missing.append(label)
-    if missing:
-        joined = "\n  - ".join(missing)
-        raise FileNotFoundError(f"Missing required runs:\n  - {joined}")
-    if not runs:
-        raise RuntimeError("No runs could be loaded")
-    return runs
+def stage_eval(evaluations: pd.DataFrame, budget: int) -> pd.DataFrame:
+    out = evaluations.copy()
 
+    if "budget_checkpoint" in out:
+        stage = out[out["budget_checkpoint"] == budget].copy()
+        if not stage.empty:
+            out = stage
 
-def build_step_metrics(run: RunData, bounds: Bounds) -> pd.DataFrame:
-    require(run.step_results, ["step", "quality", "cost", "fairness"], "step_results.parquet")
-    data, tok = step_tokens(run.step_results)
-    if "fairness_ready" in data:
-        ready = data["fairness_ready"].fillna(False).astype(bool)
+    if "test_fairness_ready" in out:
+        ready = out["test_fairness_ready"].fillna(False).astype(bool)
         if ready.any():
-            data = data[ready].copy()
+            out = out[ready].copy()
+
+    return out.reset_index(drop=True)
+
+
+def development_objectives(frame: pd.DataFrame) -> np.ndarray:
+    return np.column_stack(
+        [
+            1.0 - finite_numeric(frame["quality"]),
+            finite_numeric(frame["cost"]),
+            finite_numeric(frame["fairness"]),
+        ]
+    )
+
+
+def test_objective_matrix(frame: pd.DataFrame) -> np.ndarray:
+    return np.column_stack(
+        [
+            1.0 - finite_numeric(frame["test_quality"]),
+            finite_numeric(frame["test_cost"]),
+            finite_numeric(frame["test_fairness"]),
+        ]
+    )
+
+
+def infer_cost_bounds(step_results: pd.DataFrame, evaluations: pd.DataFrame) -> CostBounds:
+    candidates: list[float] = []
+
+    if "cost" in step_results:
+        candidates.append(float(np.nanmax(finite_numeric(step_results["cost"]))))
+
+    for column in ["dev_cost", "test_cost"]:
+        if column in evaluations:
+            candidates.append(float(np.nanmax(finite_numeric(evaluations[column]))))
+
+    cost_max = max([value for value in candidates if np.isfinite(value)] or [1.0])
+    cost_max = max(cost_max * 1.05, 1.0)
+    return CostBounds(cost_max=cost_max)
+
+
+def clean_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if "dataset" in out:
+        out = out[out["dataset"] == DATASET]
+    if "model" in out:
+        out = out[out["model"] == MODEL]
+    return out.reset_index(drop=True)
+
+
+def concatenate_step_results(runs: Sequence[RunData]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for run in runs:
+        frame = run.step_results.copy()
+        frame["run_key"] = run.run_key
+        frame["run_dir"] = str(run.logging_dir)
+        frame["model"] = MODEL
+        frame["dataset"] = DATASET
+        frame["optimizer"] = run.optimizer
+        frame["seed"] = int(run.seed)
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def concatenate_evaluations(runs: Sequence[RunData], budget: int) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for run in runs:
+        frame = stage_eval(run.evaluations, budget).copy()
+        frame["run_key"] = run.run_key
+        frame["run_dir"] = str(run.logging_dir)
+        frame["model"] = MODEL
+        frame["dataset"] = DATASET
+        frame["optimizer"] = run.optimizer
+        frame["seed"] = int(run.seed)
+        if "budget_checkpoint" not in frame:
+            frame["budget_checkpoint"] = int(budget)
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def check_clean_counts(run_metrics: pd.DataFrame) -> None:
+    counts = (
+        run_metrics.groupby(["optimizer", "budget_checkpoint"])
+        .size()
+        .rename("n_runs")
+        .reset_index()
+        .sort_values(["optimizer", "budget_checkpoint"])
+    )
+
+    print("\nRun-metric counts after cleaning")
+    print(counts.to_string(index=False))
+
+    for optimizer in OPTIMIZER_ORDER:
+        n = int(
+            counts[
+                (counts["optimizer"] == optimizer)
+                & (counts["budget_checkpoint"] == FINAL_BUDGET)
+            ]["n_runs"].sum()
+        )
+        if n != 3:
+            raise RuntimeError(
+                f"Expected 3 clean runs for {optimizer} at budget {FINAL_BUDGET}, got {n}."
+            )
+
+
+def stepwise_development_metrics(
+    step_results: pd.DataFrame,
+    evaluations: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute stepwise development-side nR2 and HV proxies from raw step results.
+
+    Exact holdout nR2/HV needs test evaluation of each step/front. This function
+    uses development objectives only, so it is an optimization trajectory proxy.
+    """
+    bounds = infer_cost_bounds(step_results, evaluations)
+    weights = make_preferences(N_PREFERENCES, PREFERENCE_SEED)
 
     rows: list[dict[str, object]] = []
-    for step, group in data.groupby("step", sort=True):
-        group = group.copy()
-        for col in ["quality", "cost", "fairness", tok]:
-            group[col] = pd.to_numeric(group[col], errors="coerce")
-        group = group.dropna(subset=["quality", "cost", "fairness", tok])
-        if group.empty:
+    group_cols = ["run_key", "run_dir", "model", "dataset", "optimizer", "seed", "step"]
+
+    data, tok = step_tokens(step_results)
+    for keys, group in data.groupby(group_cols, sort=True, dropna=False):
+        meta = dict(zip(group_cols, keys))
+
+        required = {"quality", "cost", "fairness"}
+        if missing := required - set(group.columns):
+            raise ValueError(f"step_results missing required columns: {sorted(missing)}")
+
+        quality = finite_numeric(group["quality"])
+        cost = finite_numeric(group["cost"])
+        fairness = finite_numeric(group["fairness"])
+
+        mask = np.isfinite(quality) & np.isfinite(cost) & np.isfinite(fairness)
+
+        if "fairness_ready" in group:
+            mask &= group["fairness_ready"].fillna(False).astype(bool).to_numpy()
+
+        valid = group.loc[mask].copy()
+        if valid.empty:
             continue
 
-        raw = step_objectives(group)
-        raw = raw[np.all(np.isfinite(raw), axis=1)]
-        if len(raw) == 0:
-            continue
-        norm = bounds.normalize(raw)
-        front = norm[pareto_mask_minimize(norm)]
-        best = group.sort_values(
-            ["quality", "fairness", "cost"], ascending=[False, True, True]
-        ).iloc[0]
+        raw_minimize = np.column_stack(
+            [
+                1.0 - quality[mask],
+                cost[mask],
+                fairness[mask],
+            ]
+        )
+        normalized = bounds.normalize_minimize(raw_minimize)
+        front_mask = pareto_mask_minimize(normalized)
+        front = normalized[front_mask]
 
         rows.append(
             {
-                "run_key": f"{run.optimizer}/seed{run.seed}",
-                "model": MODEL,
-                "dataset": DATASET,
-                "optimizer": run.optimizer,
-                "method": DISPLAY_NAME.get(run.optimizer, run.optimizer),
-                "seed": int(run.seed),
-                "step": int(step),
-                "actual_budget_tokens": int(group[tok].max()),
-                "dev_noisy_r2_proxy": r2(front),
-                "hv_dev_3d_proxy": hv3(front),
-                "dev_proxy_front_size": int(len(front)),
+                **meta,
+                "actual_budget_tokens": int(np.nanmax(finite_numeric(group[tok]))),
+                "dev_noisy_r2_proxy": chebyshev_r2(front, weights),
+                "hv_dev_3d": hypervolume_3d(front),
+                "dev_proxy_front_size": int(front_mask.sum()),
                 "normalization_cost_max": float(bounds.cost_max),
-                "step_best_quality": float(best["quality"]),
-                "step_best_cost": float(best["cost"]),
-                "step_best_fairness": float(best["fairness"]),
-                "n_candidates": int(len(group)),
             }
         )
 
     if not rows:
-        raise RuntimeError(f"No valid stepwise rows for {run.optimizer} seed{run.seed}")
-    return pd.DataFrame(rows).sort_values("actual_budget_tokens").reset_index(drop=True)
+        raise RuntimeError("Could not compute any stepwise development proxy rows")
+
+    return pd.DataFrame(rows)
 
 
-def best_eval_for_run(run: RunData, budget: int) -> pd.Series:
-    stage = stage_eval(run.evals, budget)
-    require(stage, ["test_quality", "test_cost", "test_fairness"], "eval.parquet")
-    return stage.sort_values(
-        ["test_quality", "test_fairness", "test_cost"], ascending=[False, True, True]
-    ).iloc[0]
-
-
-def test_front_metrics(evals: pd.DataFrame, budget: int, bounds: Bounds) -> dict[str, float]:
-    stage = stage_eval(evals, budget)
-    raw = eval_objectives(stage)
+def test_front_metrics(evaluations: pd.DataFrame, budget: int, bounds: CostBounds) -> dict[str, float]:
+    final = stage_eval(evaluations, budget)
+    raw = test_objective_matrix(final)
     raw = raw[np.all(np.isfinite(raw), axis=1)]
     if len(raw) == 0:
         return {
@@ -454,31 +485,399 @@ def test_front_metrics(evals: pd.DataFrame, budget: int, bounds: Bounds) -> dict
             "hv_test_3d_proxy": float("nan"),
             "test_front_size": 0,
         }
-    norm = bounds.normalize(raw)
-    front = norm[pareto_mask_minimize(norm)]
+
+    normalized = bounds.normalize_minimize(raw)
+    front = normalized[pareto_mask_minimize(normalized)]
+    weights = make_preferences(N_PREFERENCES, PREFERENCE_SEED)
     return {
-        "test_noisy_r2_proxy": r2(front),
-        "hv_test_3d_proxy": hv3(front),
+        "test_noisy_r2_proxy": chebyshev_r2(front, weights),
+        "hv_test_3d_proxy": hypervolume_3d(front),
         "test_front_size": int(len(front)),
     }
 
 
-def output_cost_share(df: pd.DataFrame) -> np.ndarray:
-    if {"test_input_tokens", "test_output_tokens"}.issubset(df.columns):
-        inp = num(df["test_input_tokens"])
-        out = num(df["test_output_tokens"])
-    elif {"input_tokens", "output_tokens"}.issubset(df.columns):
-        inp = num(df["input_tokens"])
-        out = num(df["output_tokens"])
+def best_eval_for_run(evaluations: pd.DataFrame, budget: int) -> pd.Series:
+    final = stage_eval(evaluations, budget)
+    required = {"test_quality", "test_cost", "test_fairness"}
+    if missing := required - set(final.columns):
+        raise ValueError(f"eval.parquet missing required columns: {sorted(missing)}")
+    return final.sort_values(
+        ["test_quality", "test_fairness", "test_cost"],
+        ascending=[False, True, True],
+    ).iloc[0]
+
+
+def build_run_metrics(
+    runs: Sequence[RunData],
+    step_proxy: pd.DataFrame,
+    evaluations: pd.DataFrame,
+) -> pd.DataFrame:
+    bounds = infer_cost_bounds(concatenate_step_results(runs), evaluations)
+    rows: list[dict[str, object]] = []
+
+    for run in runs:
+        run_steps = step_proxy[
+            (step_proxy["optimizer"] == run.optimizer) & (step_proxy["seed"] == run.seed)
+        ].sort_values("actual_budget_tokens")
+        if run_steps.empty:
+            raise RuntimeError(f"No stepwise proxy rows for {run.optimizer} seed{run.seed}")
+
+        final_dev = run_steps.iloc[-1]
+        best = best_eval_for_run(run.evaluations, FINAL_BUDGET)
+        test_metrics = test_front_metrics(run.evaluations, FINAL_BUDGET, bounds)
+
+        actual_tokens = int(final_dev["actual_budget_tokens"])
+        if "actual_tokens" in run.run_summary:
+            actual_tokens = int(float(run.run_summary["actual_tokens"]))
+
+        rows.append(
+            {
+                "run_key": run.run_key,
+                "run_dir": str(run.logging_dir),
+                "model": MODEL,
+                "dataset": DATASET,
+                "optimizer": run.optimizer,
+                "seed": int(run.seed),
+                "budget_checkpoint": FINAL_BUDGET,
+                "actual_budget_tokens": actual_tokens,
+                "noisy_r2_3d": test_metrics["test_noisy_r2_proxy"],
+                "hv_test_optimistic_3d": test_metrics["hv_test_3d_proxy"],
+                "hv_test_pessimistic_3d": test_metrics["hv_test_3d_proxy"],
+                "approximation_gap_3d": test_metrics["test_noisy_r2_proxy"]
+                - float(final_dev["dev_noisy_r2_proxy"]),
+                "balanced_test_quality": float(best["test_quality"]),
+                "balanced_test_cost": float(best["test_cost"]),
+                "balanced_test_fairness": float(best["test_fairness"]),
+                "test_front_size": test_metrics["test_front_size"],
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def prepare_staircase_grid(data: pd.DataFrame, max_budget: int | None = None) -> np.ndarray:
+    values = finite_numeric(data["actual_budget_tokens"])
+    values = values[np.isfinite(values)]
+    if max_budget is not None:
+        values = values[values <= max_budget]
+    values = np.unique(values.astype(int))
+    values = values[values > 0]
+    if len(values) == 0:
+        return np.array([], dtype=int)
+    return np.sort(values)
+
+
+def interpolate_step_values(
+    run_data: pd.DataFrame,
+    grid: np.ndarray,
+    value_col: str,
+) -> np.ndarray:
+    data = run_data.sort_values("actual_budget_tokens")
+    x = finite_numeric(data["actual_budget_tokens"])
+    y = finite_numeric(data[value_col])
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask].astype(int)
+    y = y[mask]
+
+    if len(x) == 0:
+        return np.full(len(grid), np.nan)
+
+    # Collapse duplicate token values by keeping the latest value.
+    collapsed = pd.DataFrame({"x": x, "y": y}).groupby("x", as_index=False)["y"].last()
+    x = collapsed["x"].to_numpy(dtype=int)
+    y = collapsed["y"].to_numpy(dtype=float)
+
+    out = np.full(len(grid), np.nan)
+    for i, gx in enumerate(grid):
+        idx = np.searchsorted(x, gx, side="right") - 1
+        if idx >= 0:
+            out[i] = y[idx]
+    return out
+
+
+def step_band_statistics(
+    data: pd.DataFrame,
+    value_col: str,
+    *,
+    max_budget: int | None = None,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Return per-optimizer step grid, mean, lower, upper."""
+    result: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    for optimizer in OPTIMIZER_ORDER:
+        opt = data[data["optimizer"] == optimizer].copy()
+        if opt.empty:
+            continue
+
+        grid = prepare_staircase_grid(opt, max_budget=max_budget)
+        if len(grid) == 0:
+            continue
+
+        seed_values = []
+        for _, seed_group in opt.groupby("seed", sort=True):
+            seed_values.append(interpolate_step_values(seed_group, grid, value_col))
+
+        matrix = np.vstack(seed_values)
+        mean = np.nanmean(matrix, axis=0)
+        std = np.nanstd(matrix, axis=0)
+        lower = mean - std
+        upper = mean + std
+
+        valid = np.isfinite(mean)
+        result[optimizer] = (grid[valid], mean[valid], lower[valid], upper[valid])
+
+    return result
+
+
+def plot_stepwise_nR2_proxy(step_proxy: pd.DataFrame, outdir: Path) -> None:
+    fig, ax = plt.subplots(figsize=(6.4, 4.0), constrained_layout=True)
+
+    stats = step_band_statistics(
+        step_proxy,
+        "dev_noisy_r2_proxy",
+        max_budget=1_250_000,
+    )
+
+    for optimizer in OPTIMIZER_ORDER:
+        if optimizer not in stats:
+            continue
+        grid, mean, lower, upper = stats[optimizer]
+        x = grid / 1_000_000.0
+
+        ax.step(
+            x,
+            mean,
+            where="post",
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            markevery=max(1, len(x) // 8),
+            linewidth=2,
+            markersize=4,
+            label=DISPLAY_NAME[optimizer],
+        )
+        ax.fill_between(
+            x,
+            lower,
+            upper,
+            step="post",
+            color=COLORS[optimizer],
+            alpha=0.16,
+        )
+
+    ax.set_title("Bias in Bios — Qwen-3-30B")
+    ax.set_xlabel("Token Budget [×10⁶]")
+    ax.set_ylabel("Development nR2 Proxy ↓")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="best")
+
+    note = (
+        "Stepwise proxy from development objectives.\n"
+        "Exact test nR2 requires holdout evaluation at each step."
+    )
+    ax.text(
+        0.02,
+        0.02,
+        note,
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=7,
+        alpha=0.75,
+    )
+
+    fig.savefig(outdir / "bias_in_bios_qwen3_nR2_trajectory_stepwise.pdf", bbox_inches="tight")
+    fig.savefig(outdir / "bias_in_bios_qwen3_nR2_trajectory_stepwise.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_hv_gap_trajectory(
+    trajectory: pd.DataFrame,
+    run_metrics: pd.DataFrame,
+    outdir: Path,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+
+    # Stepwise development HV from raw step_results.
+    hv_stats = step_band_statistics(
+        trajectory,
+        "hv_dev_3d",
+        max_budget=1_250_000,
+    )
+
+    ax = axes[0]
+    for optimizer in OPTIMIZER_ORDER:
+        if optimizer not in hv_stats:
+            continue
+        grid, mean, lower, upper = hv_stats[optimizer]
+        x = grid / 1_000_000.0
+        ax.step(
+            x,
+            mean,
+            where="post",
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            markevery=max(1, len(x) // 8),
+            linewidth=2,
+            markersize=4,
+            label=DISPLAY_NAME[optimizer],
+        )
+        ax.fill_between(
+            x,
+            lower,
+            upper,
+            step="post",
+            color=COLORS[optimizer],
+            alpha=0.16,
+        )
+
+    ax.set_title("Development Hypervolume ↑")
+    ax.set_xlabel("Token Budget [×10⁶]")
+    ax.set_ylabel("Development HV")
+    ax.grid(True, alpha=0.25)
+
+    # The advanced sbatch evaluates the final 1M checkpoint only.
+    # Keep the old panel style but plot the available holdout gap at 1M.
+    ax = axes[1]
+    for optimizer in OPTIMIZER_ORDER:
+        data = run_metrics[run_metrics["optimizer"] == optimizer].copy()
+        grouped = (
+            data.groupby("budget_checkpoint")["approximation_gap_3d"]
+            .agg(["mean", "std"])
+            .reset_index()
+            .sort_values("budget_checkpoint")
+        )
+        x = grouped["budget_checkpoint"].to_numpy(dtype=float) / 1_000_000.0
+        mean = grouped["mean"].to_numpy(dtype=float)
+        std = grouped["std"].fillna(0.0).to_numpy(dtype=float)
+
+        ax.step(
+            x,
+            mean,
+            where="post",
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            linewidth=2,
+            markersize=5,
+            label=DISPLAY_NAME[optimizer],
+        )
+        ax.fill_between(
+            x,
+            mean - std,
+            mean + std,
+            step="post",
+            color=COLORS[optimizer],
+            alpha=0.16,
+        )
+
+    ax.set_title("Holdout Approximation Gap ↓")
+    ax.set_xlabel("Evaluation-token checkpoint [×10⁶]")
+    ax.set_ylabel("Approximation Gap")
+    ax.grid(True, alpha=0.25)
+    ax.set_xticks([1.0])
+    ax.set_xticklabels(["1M"])
+
+    axes[0].legend(frameon=False, loc="best")
+    fig.suptitle("Bias in Bios — Qwen-3-30B: Trajectory diagnostics", y=1.03)
+
+    fig.savefig(outdir / "bias_in_bios_qwen3_hv_gap_trajectory_stepwise.pdf", bbox_inches="tight")
+    fig.savefig(outdir / "bias_in_bios_qwen3_hv_gap_trajectory_stepwise.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def final_checkpoint_evaluations(evaluations: pd.DataFrame) -> pd.DataFrame:
+    if "budget_checkpoint" in evaluations:
+        final = evaluations[evaluations["budget_checkpoint"] == FINAL_BUDGET].copy()
     else:
-        return np.zeros(len(df), dtype=float)
-    weighted_in = QWEN_INPUT_WEIGHT * inp
-    weighted_out = QWEN_OUTPUT_WEIGHT * out
-    denom = weighted_in + weighted_out
-    return np.divide(weighted_out, denom, out=np.zeros_like(weighted_out), where=denom > 0)
+        final = evaluations.copy()
+    if final.empty:
+        raise RuntimeError(f"No evaluations for budget_checkpoint={FINAL_BUDGET}")
+    return final.reset_index(drop=True)
 
 
-def fewshot_count(value: object) -> int:
+def y_attained_at_x(data: pd.DataFrame, x_grid: np.ndarray, x_col: str) -> np.ndarray:
+    """For minimization x and maximization accuracy, return best accuracy at x <= grid."""
+    x = finite_numeric(data[x_col])
+    y = finite_numeric(data["test_quality"])
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    out = np.full(len(x_grid), np.nan)
+    for i, gx in enumerate(x_grid):
+        eligible = y[x <= gx]
+        if len(eligible):
+            out[i] = np.max(eligible)
+    return out
+
+
+def plot_empirical_attainment(
+    evaluations: pd.DataFrame,
+    outdir: Path,
+    *,
+    x_col: str,
+    xlabel: str,
+    filename: str,
+) -> None:
+    final = final_checkpoint_evaluations(evaluations)
+
+    xmin = float(np.nanmin(finite_numeric(final[x_col])))
+    xmax = float(np.nanmax(finite_numeric(final[x_col])))
+    padding = 0.03 * max(xmax - xmin, 1e-6)
+    x_grid = np.linspace(xmin - padding, xmax + padding, 400)
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.2), constrained_layout=True)
+
+    for optimizer in OPTIMIZER_ORDER:
+        opt = final[final["optimizer"] == optimizer].copy()
+        if opt.empty:
+            continue
+
+        seed_curves = []
+        for _, seed_group in opt.groupby("seed", sort=True):
+            # Use the 3D test non-dominated candidates from each seed.
+            mask = pareto_mask_minimize(test_objective_matrix(seed_group))
+            front = seed_group.loc[mask].copy()
+            seed_curves.append(y_attained_at_x(front, x_grid, x_col))
+
+        matrix = np.vstack(seed_curves)
+        median = np.nanmedian(matrix, axis=0)
+        lower = np.nanmin(matrix, axis=0)
+        upper = np.nanmax(matrix, axis=0)
+        valid = np.isfinite(median)
+
+        ax.step(
+            x_grid[valid],
+            median[valid],
+            where="post",
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            markevery=max(1, int(valid.sum() / 8)),
+            linewidth=2,
+            markersize=4,
+            label=DISPLAY_NAME[optimizer],
+        )
+        ax.fill_between(
+            x_grid[valid],
+            lower[valid],
+            upper[valid],
+            step="post",
+            color=COLORS[optimizer],
+            alpha=0.16,
+        )
+
+    ax.set_title("Bias in Bios — Qwen-3-30B at 1M")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Test Macro-F1")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="lower right")
+
+    fig.savefig(outdir / f"{filename}.pdf", bbox_inches="tight")
+    fig.savefig(outdir / f"{filename}.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def parse_fewshot_count(value: object) -> int:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return 0
     if isinstance(value, list):
@@ -488,465 +887,268 @@ def fewshot_count(value: object) -> int:
         return 0
     try:
         loaded = json.loads(text)
-        return len(loaded) if isinstance(loaded, list) else 0
+        if isinstance(loaded, list):
+            return len(loaded)
     except json.JSONDecodeError:
         return 0
+    return 0
 
 
-def all_final_eval_rows(runs: Sequence[RunData], budget: int) -> pd.DataFrame:
-    frames = []
-    for run in runs:
-        frame = stage_eval(run.evals, budget).copy()
-        frame["optimizer"] = run.optimizer
-        frame["method"] = DISPLAY_NAME.get(run.optimizer, run.optimizer)
-        frame["seed"] = run.seed
-        if "few_shots_json" in frame:
-            frame["fewshot_count"] = frame["few_shots_json"].apply(fewshot_count)
-        else:
-            frame["fewshot_count"] = 0
-        frame["output_cost_share"] = output_cost_share(frame)
-        frames.append(frame)
-    return pd.concat(frames, ignore_index=True, sort=False)
+def output_cost_share(frame: pd.DataFrame) -> np.ndarray:
+    if {"test_input_tokens", "test_output_tokens"}.issubset(frame.columns):
+        input_tokens = finite_numeric(frame["test_input_tokens"])
+        output_tokens = finite_numeric(frame["test_output_tokens"])
+    elif {"input_tokens", "output_tokens"}.issubset(frame.columns):
+        input_tokens = finite_numeric(frame["input_tokens"])
+        output_tokens = finite_numeric(frame["output_tokens"])
+    else:
+        return np.zeros(len(frame), dtype=float)
+
+    weighted_input = QWEN_INPUT_WEIGHT * input_tokens
+    weighted_output = QWEN_OUTPUT_WEIGHT * output_tokens
+    denom = weighted_input + weighted_output
+    share = np.divide(
+        weighted_output,
+        denom,
+        out=np.zeros_like(weighted_output, dtype=float),
+        where=denom > 0,
+    )
+    return np.clip(share, 0.0, 1.0)
 
 
-def build_summary(runs: Sequence[RunData], step_metrics: pd.DataFrame, bounds: Bounds, budget: int) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for run in runs:
-        best = best_eval_for_run(run, budget)
-        sm = step_metrics[(step_metrics["optimizer"] == run.optimizer) & (step_metrics["seed"] == run.seed)]
-        final_dev = sm.sort_values("actual_budget_tokens").iloc[-1]
-        test_metrics = test_front_metrics(run.evals, budget, bounds)
-        actual_tokens = int(final_dev["actual_budget_tokens"])
-        if "actual_tokens" in run.run_summary:
-            actual_tokens = int(float(run.run_summary["actual_tokens"]))
+def trifair_final_incumbents(evaluations: pd.DataFrame) -> pd.DataFrame:
+    final = final_checkpoint_evaluations(evaluations)
+    data = final[final["optimizer"] == "Tri-Fair"].copy()
 
-        row: dict[str, object] = {
-            "Method": DISPLAY_NAME.get(run.optimizer, run.optimizer),
-            "Optimizer": run.optimizer,
-            "Seed": int(run.seed),
-            "Requested budget": int(budget),
-            "Actual tokens": actual_tokens,
-            "Tier": TIER,
-            "Chosen step": best.get("chosen_step", np.nan),
-            "Eval rows": len(stage_eval(run.evals, budget)),
-            "Development nR2 proxy ↓": float(final_dev["dev_noisy_r2_proxy"]),
-            "Test nR2 proxy ↓": test_metrics["test_noisy_r2_proxy"],
-            "Development HV proxy ↑": float(final_dev["hv_dev_3d_proxy"]),
-            "Test HV proxy ↑": test_metrics["hv_test_3d_proxy"],
-            "nR2 Gap Proxy ↓": test_metrics["test_noisy_r2_proxy"] - float(final_dev["dev_noisy_r2_proxy"]),
-            "Best Test Macro-F1 ↑": float(best["test_quality"]),
-            "Best Test Cost ↓": float(best["test_cost"]),
-            "Best Test Unfairness ↓": float(best["test_fairness"]),
-            "Test Fairness Ready": best.get("test_fairness_ready", np.nan),
-            "Logging dir": str(run.logging_dir),
-        }
-        if run.pred_summary is not None and len(run.pred_summary):
-            pred = run.pred_summary.iloc[0]
-            for src, dst in [
-                ("recomputed_macro_f1_normalized", "Recomputed Macro-F1"),
-                ("accuracy_normalized", "Accuracy"),
-                ("invalid_rate_after_normalization", "Invalid Rate"),
-                ("n_examples", "Prediction Examples"),
-            ]:
-                if src in pred:
-                    row[dst] = pred[src]
-        rows.append(row)
-    return pd.DataFrame(rows).sort_values(["Optimizer", "Seed"]).reset_index(drop=True)
+    if "is_incumbent" in data and data["is_incumbent"].notna().any():
+        incumbent = data[data["is_incumbent"].fillna(False).astype(bool)].copy()
+        if not incumbent.empty:
+            data = incumbent
+
+    if data.empty:
+        raise RuntimeError("No Tri-Fair final incumbent/evaluation rows found")
+
+    if "few_shots_json" in data:
+        data["fewshot_count"] = data["few_shots_json"].apply(parse_fewshot_count)
+    else:
+        data["fewshot_count"] = 0
+    data["output_cost_share"] = output_cost_share(data)
+    return data.reset_index(drop=True)
 
 
-def aggregate_summary(summary: pd.DataFrame) -> pd.DataFrame:
-    metric_cols = [
-        "Actual tokens",
-        "Best Test Macro-F1 ↑",
-        "Best Test Cost ↓",
-        "Best Test Unfairness ↓",
-        "Development nR2 proxy ↓",
-        "Test nR2 proxy ↓",
-        "Development HV proxy ↑",
-        "Test HV proxy ↑",
-        "nR2 Gap Proxy ↓",
-    ]
-    optional = ["Recomputed Macro-F1", "Accuracy", "Invalid Rate"]
-    metric_cols.extend([col for col in optional if col in summary.columns])
-    rows = []
-    for method, group in summary.groupby("Method", sort=False):
-        row: dict[str, object] = {"Method": method, "n_seeds": int(group["Seed"].nunique())}
-        for col in metric_cols:
-            values = pd.to_numeric(group[col], errors="coerce")
-            row[f"{col} mean"] = float(values.mean())
-            row[f"{col} std"] = float(values.std(ddof=1)) if values.notna().sum() > 1 else 0.0
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def step_interpolate(x: np.ndarray, y: np.ndarray, grid: np.ndarray) -> np.ndarray:
-    order = np.argsort(x)
-    x = x[order]
-    y = y[order]
-    out = np.full(len(grid), np.nan)
-    for i, gx in enumerate(grid):
-        idx = np.searchsorted(x, gx, side="right") - 1
-        if idx >= 0:
-            out[i] = y[idx]
-    return out
-
-
-def plot_step_metric(
-    step_metrics: pd.DataFrame,
+def plot_trifair_fewshot_scatter(
+    evaluations: pd.DataFrame,
     outdir: Path,
-    col: str,
-    ylabel: str,
-    title: str,
-    stem: str,
-    max_budget: int,
+    *,
+    color_col: str,
+    color_label: str,
+    filename: str,
+    cmap: str,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(6.8, 4.2), constrained_layout=True)
-    grid = np.linspace(0, max_budget, 160)
+    data = trifair_final_incumbents(evaluations)
 
-    for optimizer, group in step_metrics.groupby("optimizer", sort=False):
-        color = COLORS.get(optimizer, None)
-        marker = MARKERS.get(optimizer, "o")
-        curves = []
-        for seed, seed_group in group.groupby("seed", sort=True):
-            seed_group = seed_group.sort_values("actual_budget_tokens")
-            x = num(seed_group["actual_budget_tokens"])
-            y = num(seed_group[col])
-            mask = np.isfinite(x) & np.isfinite(y)
-            if not mask.any():
-                continue
-            x = x[mask]
-            y = y[mask]
-            ax.step(
-                x / 1_000_000,
-                y,
-                where="post",
-                color=color,
-                alpha=0.22,
-                linewidth=1.1,
-            )
-            curves.append(step_interpolate(x, y, grid))
+    fig, ax = plt.subplots(figsize=(6.6, 4.8), constrained_layout=True)
 
-        if curves:
-            arr = np.vstack(curves)
-            mean = np.nanmean(arr, axis=0)
-            std = np.nanstd(arr, axis=0)
-            valid = np.isfinite(mean)
-            ax.step(
-                grid[valid] / 1_000_000,
-                mean[valid],
-                where="post",
-                color=color,
-                marker=marker,
-                markevery=max(1, int(valid.sum() / 8)),
-                linewidth=2.2,
-                markersize=4,
-                label=DISPLAY_NAME.get(optimizer, optimizer),
-            )
-            ax.fill_between(
-                grid[valid] / 1_000_000,
-                mean[valid] - std[valid],
-                mean[valid] + std[valid],
-                step="post",
-                color=color,
-                alpha=0.12,
-            )
+    values = finite_numeric(data[color_col])
+    vmin = float(np.nanmin(values)) if np.isfinite(values).any() else 0.0
+    vmax = float(np.nanmax(values)) if np.isfinite(values).any() else 1.0
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-6
 
-    ax.set_title(title)
-    ax.set_xlabel("Token Budget [×10⁶]")
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="best")
-    save(fig, outdir, stem)
+    scatter = ax.scatter(
+        data["test_cost"],
+        data["test_quality"],
+        c=values,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        edgecolor="black",
+        linewidth=0.5,
+        s=72,
+        alpha=0.95,
+    )
 
-
-def attained_y(front: pd.DataFrame, grid: np.ndarray, x_col: str) -> np.ndarray:
-    x = num(front[x_col])
-    y = num(front["test_quality"])
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    out = np.full(len(grid), np.nan)
-    for i, gx in enumerate(grid):
-        eligible = y[x <= gx]
-        if len(eligible):
-            out[i] = np.max(eligible)
-    return out
-
-
-def plot_attainment(final: pd.DataFrame, outdir: Path, x_col: str, xlabel: str, stem: str) -> None:
-    require(final, [x_col, "test_quality", "test_cost", "test_fairness", "optimizer"], "final eval rows")
-    fig, ax = plt.subplots(figsize=(6.8, 4.4), constrained_layout=True)
-
-    for optimizer, group in final.groupby("optimizer", sort=False):
-        color = COLORS.get(optimizer, None)
-        marker = MARKERS.get(optimizer, "o")
-        x = num(group[x_col])
-        y = num(group["test_quality"])
-        ax.scatter(
-            x,
-            y,
-            color=color,
-            marker=marker,
-            alpha=0.35,
-            s=36,
-            label=f"{DISPLAY_NAME.get(optimizer, optimizer)} candidates",
+    for _, row in data.iterrows():
+        ax.text(
+            float(row["test_cost"]),
+            float(row["test_quality"]) + 0.002,
+            str(int(row["fewshot_count"])),
+            ha="center",
+            va="bottom",
+            fontsize=7,
         )
 
-        obj = eval_objectives(group)
-        mask = np.all(np.isfinite(obj), axis=1)
-        front = group.loc[mask].iloc[pareto_mask_minimize(obj[mask])].copy()
-        if front.empty:
-            continue
-        xmin = float(np.nanmin(num(front[x_col])))
-        xmax = float(np.nanmax(num(front[x_col])))
-        pad = 0.03 * max(xmax - xmin, 1e-6)
-        grid = np.linspace(xmin - pad, xmax + pad, 400)
-        curve = attained_y(front, grid, x_col)
-        valid = np.isfinite(curve)
-        ax.step(
-            grid[valid],
-            curve[valid],
-            where="post",
-            color=color,
-            linewidth=2.2,
-            label=f"{DISPLAY_NAME.get(optimizer, optimizer)} Pareto attainment",
-        )
-
-    ax.set_title("Bias in Bios — Qwen-3-30B at 1M")
-    ax.set_xlabel(xlabel)
+    ax.set_title("Tri-Fair on Bias in Bios — Qwen-3-30B at 1M")
+    ax.set_xlabel("Avg. Cost [$] per 1M Calls")
     ax.set_ylabel("Test Macro-F1")
     ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="best")
-    save(fig, outdir, stem)
+
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label(color_label)
+
+    fig.savefig(outdir / f"{filename}.pdf", bbox_inches="tight")
+    fig.savefig(outdir / f"{filename}.png", bbox_inches="tight")
+    plt.close(fig)
 
 
-def plot_seed_summary(summary: pd.DataFrame, outdir: Path) -> None:
-    fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
-    methods = list(summary["Method"].drop_duplicates())
-    seeds = sorted(summary["Seed"].unique())
-    width = 0.34 if len(methods) <= 2 else 0.8 / len(methods)
-    x = np.arange(len(seeds))
+def write_summary_table(run_metrics: pd.DataFrame, outdir: Path) -> None:
+    selected = run_metrics[run_metrics["budget_checkpoint"] == FINAL_BUDGET].copy()
 
-    for j, method in enumerate(methods):
-        group = summary[summary["Method"] == method].set_index("Seed")
-        vals = [float(group.loc[seed, "Best Test Macro-F1 ↑"]) if seed in group.index else np.nan for seed in seeds]
-        offset = (j - (len(methods) - 1) / 2) * width
-        optimizer = str(summary[summary["Method"] == method]["Optimizer"].iloc[0])
-        ax.bar(x + offset, vals, width=width, color=COLORS.get(optimizer, None), alpha=0.85, label=method)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(seed) for seed in seeds])
-    ax.set_xlabel("Seed")
-    ax.set_ylabel("Best Test Macro-F1")
-    ax.set_title("Bias in Bios — 1M best test Macro-F1 by seed")
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(frameon=False)
-    save(fig, outdir, "bias_in_bios_qwen3_1m_seed_macro_f1_summary")
-
-
-def plot_cost_fairness_summary(summary: pd.DataFrame, outdir: Path) -> None:
-    fig, ax = plt.subplots(figsize=(6.8, 4.6), constrained_layout=True)
-    for optimizer, group in summary.groupby("Optimizer", sort=False):
-        ax.scatter(
-            group["Best Test Cost ↓"],
-            group["Best Test Unfairness ↓"],
-            s=80,
-            color=COLORS.get(optimizer, None),
-            marker=MARKERS.get(optimizer, "o"),
-            label=DISPLAY_NAME.get(optimizer, optimizer),
-            alpha=0.9,
+    rows = []
+    for optimizer in OPTIMIZER_ORDER:
+        data = selected[selected["optimizer"] == optimizer].copy()
+        rows.append(
+            {
+                "Method": DISPLAY_NAME[optimizer],
+                "Actual tokens mean": data["actual_budget_tokens"].mean(),
+                "nR2 ↓": data["noisy_r2_3d"].mean(),
+                "HVopt ↑": data["hv_test_optimistic_3d"].mean(),
+                "HVpes ↑": data["hv_test_pessimistic_3d"].mean(),
+                "Gap ↓": data["approximation_gap_3d"].mean(),
+                "Balanced Test Macro-F1 ↑": data["balanced_test_quality"].mean(),
+                "Balanced Test Cost ↓": data["balanced_test_cost"].mean(),
+                "Balanced Test Unfairness ↓": data["balanced_test_fairness"].mean(),
+                "Seeds": len(data),
+            }
         )
-        for _, row in group.iterrows():
-            ax.annotate(
-                f"s{int(row['Seed'])}",
-                (float(row["Best Test Cost ↓"]), float(row["Best Test Unfairness ↓"])),
-                xytext=(5, 5),
-                textcoords="offset points",
-                fontsize=8,
-            )
-    ax.set_title("Bias in Bios — 1M cost–unfairness selected prompts")
-    ax.set_xlabel("Best Test Cost ↓")
-    ax.set_ylabel("Best Test Unfairness ↓")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False)
-    save(fig, outdir, "bias_in_bios_qwen3_1m_cost_unfairness_selected")
 
+    table = pd.DataFrame(rows)
+    table.to_csv(outdir / "bias_in_bios_qwen3_1m_summary_table.csv", index=False)
+    (outdir / "bias_in_bios_qwen3_1m_summary_table.md").write_text(
+        table.to_markdown(index=False, floatfmt=".4f") + "\n",
+        encoding="utf-8",
+    )
 
-def plot_per_profession(per_prof: pd.DataFrame, outdir: Path) -> None:
-    if per_prof.empty or not {"profession", "f1", "optimizer"}.issubset(per_prof.columns):
-        return
-    data = per_prof.copy()
-    data["f1"] = pd.to_numeric(data["f1"], errors="coerce")
-    data = data.dropna(subset=["f1"])
-    if data.empty:
-        return
-    worst = data.groupby("profession")["f1"].mean().sort_values().head(15).index.tolist()
-    plot_df = data[data["profession"].isin(worst)].copy()
-    order = {name: i for i, name in enumerate(worst)}
-
-    fig, ax = plt.subplots(figsize=(8.0, 5.6), constrained_layout=True)
-    methods = list(plot_df["optimizer"].drop_duplicates())
-    width = 0.35 if len(methods) <= 2 else 0.8 / len(methods)
-    x = np.arange(len(worst))
-    for j, optimizer in enumerate(methods):
-        vals = (
-            plot_df[plot_df["optimizer"] == optimizer]
-            .groupby("profession")["f1"]
-            .mean()
-            .reindex(worst)
-            .to_numpy()
-        )
-        offset = (j - (len(methods) - 1) / 2) * width
-        ax.bar(x + offset, vals, width=width, color=COLORS.get(optimizer, None), alpha=0.85, label=DISPLAY_NAME.get(optimizer, optimizer))
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(worst, rotation=45, ha="right")
-    ax.set_ylabel("Mean F1")
-    ax.set_title("Bias in Bios — hardest professions by mean F1")
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(frameon=False)
-    save(fig, outdir, "bias_in_bios_qwen3_1m_worst_profession_f1")
+    print("\n1M summary table")
+    print(table.to_string(index=False))
 
 
 def write_readme(outdir: Path, args: argparse.Namespace, runs: Sequence[RunData]) -> None:
-    loaded = "\n".join(
-        f"- {run.optimizer} seed{run.seed}: `{run.logging_dir}`" for run in runs
-    )
-    text = f"""# Bias in Bios / Qwen-3-30B advanced 1M curated figures
+    loaded = "\n".join(f"- {run.optimizer} seed{run.seed}: `{run.logging_dir}`" for run in runs)
+    readme = f"""# Bias in Bios / Qwen-3-30B 1M curated figures
 
-Generated by `analysis.make_bias_170287_figures` after upgrading the old single-run
-170287 diagnostic script to the full prompt-only advanced 1M setup.
+Files generated by `analysis.make_bias_170287_figures`.
+
+This is the advanced prompt-only Bias 1M setup, but the visual style and file
+names intentionally match the original `analysis.make_bias_1m_figures.py` output.
 
 Results root: `{args.results_root}`
-Prediction root searched: `{args.prediction_root}`
-Budget: `{args.budget}`
-Optimizers: `{args.optimizers}`
-Seeds: `{args.seeds}`
 
 Loaded runs:
 {loaded}
 
-Main files:
-- `bias_in_bios_qwen3_1m_stepwise_dev_metrics.csv`
-- `bias_in_bios_qwen3_1m_final_eval_rows.csv`
-- `bias_in_bios_qwen3_1m_summary_table.csv`
-- `bias_in_bios_qwen3_1m_method_summary.csv`
-- `bias_in_bios_qwen3_1m_nR2_trajectory_stepwise.*`
-- `bias_in_bios_qwen3_1m_hv_trajectory_stepwise.*`
-- `bias_in_bios_qwen3_1m_attainment_macro_f1_cost.*`
-- `bias_in_bios_qwen3_1m_attainment_macro_f1_unfairness.*`
+## Important note on nR2 trajectories
 
-Note: this script intentionally does not add Initial Instructions yet.  Add Initial
-after the six optimized runs are complete and then regenerate the final Bias figure.
+`bias_in_bios_qwen3_nR2_trajectory_stepwise.*` is a development-side stepwise nR2 proxy
+computed from `step_results.parquet`.
+
+Exact MO-CAPO-style stepwise holdout nR2 would require evaluating each
+intermediate optimizer front on the holdout set. Current `eval.parquet` files
+contain checkpoint-level holdout evaluations only.
+
+## Figures
+
+- `bias_in_bios_qwen3_nR2_trajectory_stepwise.*`
+  Stepwise development nR2 proxy, mean ± std across seeds.
+
+- `bias_in_bios_qwen3_hv_gap_trajectory_stepwise.*`
+  Stepwise development hypervolume plus final-checkpoint holdout approximation gap proxy.
+
+- `bias_in_bios_qwen3_1m_attainment_accuracy_cost.*`
+  Empirical-attainment-style Test Macro-F1 vs Avg. Cost at the 1M checkpoint.
+
+- `bias_in_bios_qwen3_1m_attainment_accuracy_unfairness.*`
+  Empirical-attainment-style Test Macro-F1 vs Test Unfairness at the 1M checkpoint.
+
+- `bias_in_bios_qwen3_1m_trifair_fewshot_outputshare.*`
+  Tri-Fair final incumbent/evaluated candidates. Labels show few-shot count;
+  color shows weighted output-token cost share.
+
+- `bias_in_bios_qwen3_1m_trifair_fewshot_unfairness.*`
+  Same Tri-Fair candidates. Labels show few-shot count; color shows test unfairness.
 """
-    (outdir / "README.md").write_text(text, encoding="utf-8")
+    (outdir / "README.md").write_text(readme, encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--dataset", default=DATASET)
-    parser.add_argument("--budget", type=int, default=BUDGET)
+    parser.add_argument("--budget", type=int, default=FINAL_BUDGET)
     parser.add_argument("--tier", default=TIER)
     parser.add_argument("--results-root", default=DEFAULT_RESULTS_ROOT)
-    parser.add_argument("--prediction-root", default=DEFAULT_PREDICTION_ROOT)
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
-    parser.add_argument("--optimizers", default=",".join(DEFAULT_OPTIMIZERS))
-    parser.add_argument("--seeds", default=",".join(str(x) for x in DEFAULT_SEEDS))
+    parser.add_argument("--optimizers", default=",".join(OPTIMIZER_ORDER))
+    parser.add_argument("--seeds", default="42,43,44")
     parser.add_argument("--allow-missing", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    global MODEL, DATASET, FINAL_BUDGET, TIER
+    MODEL = args.model
+    DATASET = args.dataset
+    FINAL_BUDGET = int(args.budget)
+    TIER = args.tier
+
     configure_style()
-    outdir = Path(args.out_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    outdir = output_dir(args)
 
     runs = load_runs(args)
-    bounds = infer_global_bounds(runs)
-    step_metrics = pd.concat(
-        [build_step_metrics(run, bounds) for run in runs],
-        ignore_index=True,
-        sort=False,
-    )
-    final_rows = all_final_eval_rows(runs, args.budget)
-    summary = build_summary(runs, step_metrics, bounds, args.budget)
-    method_summary = aggregate_summary(summary)
+    step_results = clean_frame(concatenate_step_results(runs))
+    evaluations = clean_frame(concatenate_evaluations(runs, args.budget))
 
-    per_prof_frames = []
-    for run in runs:
-        if run.per_profession is not None and len(run.per_profession):
-            frame = run.per_profession.copy()
-            frame["optimizer"] = run.optimizer
-            frame["method"] = DISPLAY_NAME.get(run.optimizer, run.optimizer)
-            frame["seed"] = run.seed
-            per_prof_frames.append(frame)
-    per_prof_all = pd.concat(per_prof_frames, ignore_index=True, sort=False) if per_prof_frames else pd.DataFrame()
+    step_proxy = stepwise_development_metrics(step_results, evaluations)
+    run_metrics = build_run_metrics(runs, step_proxy, evaluations)
+    check_clean_counts(run_metrics)
 
-    step_metrics.to_csv(outdir / "bias_in_bios_qwen3_1m_stepwise_dev_metrics.csv", index=False)
-    final_rows.to_csv(outdir / "bias_in_bios_qwen3_1m_final_eval_rows.csv", index=False)
-    summary.to_csv(outdir / "bias_in_bios_qwen3_1m_summary_table.csv", index=False)
-    method_summary.to_csv(outdir / "bias_in_bios_qwen3_1m_method_summary.csv", index=False)
-    if not per_prof_all.empty:
-        per_prof_all.to_csv(outdir / "bias_in_bios_qwen3_1m_per_profession_f1_source.csv", index=False)
+    step_proxy.to_csv(outdir / "bias_in_bios_qwen3_stepwise_dev_nR2_proxy.csv", index=False)
+    step_proxy.to_csv(outdir / "bias_in_bios_qwen3_stepwise_dev_metrics.csv", index=False)
+    run_metrics.to_csv(outdir / "bias_in_bios_qwen3_1m_run_metrics_proxy.csv", index=False)
+    evaluations.to_csv(outdir / "bias_in_bios_qwen3_1m_eval_rows.csv", index=False)
 
-    try:
-        (outdir / "bias_in_bios_qwen3_1m_summary_table.md").write_text(
-            summary.to_markdown(index=False, floatfmt=".6f") + "\n",
-            encoding="utf-8",
-        )
-        (outdir / "bias_in_bios_qwen3_1m_method_summary.md").write_text(
-            method_summary.to_markdown(index=False, floatfmt=".6f") + "\n",
-            encoding="utf-8",
-        )
-    except Exception:
-        (outdir / "bias_in_bios_qwen3_1m_summary_table.md").write_text(
-            summary.to_csv(index=False), encoding="utf-8"
-        )
-        (outdir / "bias_in_bios_qwen3_1m_method_summary.md").write_text(
-            method_summary.to_csv(index=False), encoding="utf-8"
-        )
+    plot_stepwise_nR2_proxy(step_proxy, outdir)
+    plot_hv_gap_trajectory(step_proxy, run_metrics, outdir)
 
-    max_budget = int(max(args.budget, step_metrics["actual_budget_tokens"].max()))
-    plot_step_metric(
-        step_metrics,
+    plot_empirical_attainment(
+        evaluations,
         outdir,
-        "dev_noisy_r2_proxy",
-        "Development nR2 Proxy ↓",
-        "Bias in Bios — Qwen-3-30B: development nR2 proxy",
-        "bias_in_bios_qwen3_1m_nR2_trajectory_stepwise",
-        max_budget,
+        x_col="test_cost",
+        xlabel="Avg. Cost [$] per 1M Calls",
+        filename="bias_in_bios_qwen3_1m_attainment_accuracy_cost",
     )
-    plot_step_metric(
-        step_metrics,
-        outdir,
-        "hv_dev_3d_proxy",
-        "Development HV Proxy ↑",
-        "Bias in Bios — Qwen-3-30B: development hypervolume proxy",
-        "bias_in_bios_qwen3_1m_hv_trajectory_stepwise",
-        max_budget,
-    )
-    plot_attainment(
-        final_rows,
-        outdir,
-        "test_cost",
-        "Avg. Cost [$] per 1M Calls",
-        "bias_in_bios_qwen3_1m_attainment_macro_f1_cost",
-    )
-    plot_attainment(
-        final_rows,
-        outdir,
-        "test_fairness",
-        "Test Unfairness",
-        "bias_in_bios_qwen3_1m_attainment_macro_f1_unfairness",
-    )
-    plot_seed_summary(summary, outdir)
-    plot_cost_fairness_summary(summary, outdir)
-    if not per_prof_all.empty:
-        plot_per_profession(per_prof_all, outdir)
 
+    plot_empirical_attainment(
+        evaluations,
+        outdir,
+        x_col="test_fairness",
+        xlabel="Test Unfairness",
+        filename="bias_in_bios_qwen3_1m_attainment_accuracy_unfairness",
+    )
+
+    plot_trifair_fewshot_scatter(
+        evaluations,
+        outdir,
+        color_col="output_cost_share",
+        color_label="Output Token Cost Share",
+        filename="bias_in_bios_qwen3_1m_trifair_fewshot_outputshare",
+        cmap="viridis",
+    )
+
+    plot_trifair_fewshot_scatter(
+        evaluations,
+        outdir,
+        color_col="test_fairness",
+        color_label="Test Unfairness ↓",
+        filename="bias_in_bios_qwen3_1m_trifair_fewshot_unfairness",
+        cmap="viridis",
+    )
+
+    write_summary_table(run_metrics, outdir)
     write_readme(outdir, args, runs)
+
     pd.DataFrame(
         [
             {"file": p.name, "bytes": p.stat().st_size}
@@ -955,12 +1157,8 @@ def main() -> None:
         ]
     ).to_csv(outdir / "manifest.csv", index=False)
 
-    print("\nCurated advanced Bias 1M MO-CAPO-style figures written to:")
+    print("\nCurated MO-CAPO-style figures written to:")
     print(outdir.resolve())
-    print("\nPer-run summary")
-    print(summary.to_string(index=False))
-    print("\nMean by method")
-    print(method_summary.to_string(index=False))
 
 
 if __name__ == "__main__":
