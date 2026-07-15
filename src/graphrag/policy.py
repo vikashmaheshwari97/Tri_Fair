@@ -230,23 +230,35 @@ def build_policy_prompt(row: dict[str, Any], policy: GraphRAGPolicy) -> tuple[st
     selected = ordered[: max(0, int(policy.max_paths))]
     context = build_context(ordered, policy=policy)
 
-    pieces = ["[INST] <<SYS>>", "<</SYS>>", policy.instruction.strip()]
+    pieces = [
+        "You are a careful knowledge-graph question-answering assistant.",
+        policy.instruction.strip(),
+    ]
     if policy.include_fairness_instruction and policy.fairness_instruction.strip():
         pieces.append(policy.fairness_instruction.strip())
+
     pieces.extend(
         [
             "",
-            "Reasoning Paths:",
-            context,
+            "Knowledge from retrieved reasoning paths:",
+            context if context.strip() else "- No retrieved graph evidence was provided.",
             "",
             "Question:",
             question + ("?" if question and not question.endswith("?") else ""),
             "",
+            "Output rules:",
+            "- Return only the final answer text.",
+            "- Do not include explanations, reasoning, citations, prompt tags, or markup.",
+            "- Do not repeat the question.",
+            "- If multiple answers are supported, put one answer per line.",
+            "- If the graph evidence is insufficient, return the best supported answer only.",
+            "",
             policy.answer_format.strip(),
-            "[/INST]",
+            "",
+            "Answer:",
         ]
     )
-    prompt = "\n".join(pieces).strip()
+    prompt = "\n".join(part for part in pieces if part is not None).strip()
     diagnostics = {
         "n_original_paths": len(paths),
         "n_selected_paths": len(selected),

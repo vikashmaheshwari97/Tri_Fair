@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import re
 from pathlib import Path
 
 
@@ -75,6 +76,46 @@ def load_vllm_classes():
     return getattr(module, "LLM"), getattr(module, "SamplingParams")
 
 
+def postprocess_prediction(text: str) -> str:
+    """Remove prompt markers and common explanatory boilerplate from raw generations."""
+    value = str(text).strip()
+
+    for marker in ["[/INST]", "[INST]", "<<SYS>>", "<</SYS>>"]:
+        value = value.replace(marker, " ")
+
+    value = re.sub(r"<\|[^|]+\|>", " ", value)
+
+    # If the model echoes an answer prefix, keep only the generated answer content.
+    if "Answer:" in value:
+        value = value.split("Answer:", 1)[-1].strip()
+
+    # Remove common explanation sections while preserving multi-line answer lists.
+    stop_markers = [
+        "\nExplanation:",
+        "\nReasoning:",
+        "\nBecause:",
+        "\nNote:",
+        "\nQuestion:",
+        "\nKnowledge from retrieved reasoning paths:",
+        "\nOutput rules:",
+    ]
+    for marker in stop_markers:
+        if marker in value:
+            value = value.split(marker, 1)[0].strip()
+
+    cleaned_lines = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith(("explanation:", "reasoning:", "question:", "output rules:")):
+            continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
 def main() -> None:
     args = parse_args()
     LLM, SamplingParams = load_vllm_classes()
@@ -105,6 +146,7 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_output_tokens,
+        stop=["<|im_end|>", "</s>", "[/INST]", "[INST]"],
     )
 
     for start in range(0, len(todo), args.batch_size):
@@ -113,7 +155,8 @@ def main() -> None:
 
         out_rows: list[dict] = []
         for row, generation in zip(batch, generations):
-            text = generation.outputs[0].text.strip() if generation.outputs else ""
+            raw_text = generation.outputs[0].text.strip() if generation.outputs else ""
+            text = postprocess_prediction(raw_text)
             out_rows.append(
                 {
                     "id": row.get("id", ""),
