@@ -63,20 +63,39 @@ def _answer_list(value: object) -> list[str]:
 
 
 def _extract_reasoning_path_block(prompt_input: str) -> list[str]:
-    """Extract graph path lines from a GNN-RAG prompt input when present."""
+    """Extract graph path lines from original GNN-RAG and Tri-Fair-GR prompts."""
     text = str(prompt_input)
-    marker = "Reasoning Paths:"
-    if marker not in text:
+
+    markers = [
+        "Reasoning Paths:",
+        "Knowledge from retrieved reasoning paths:",
+    ]
+
+    after = ""
+    for marker in markers:
+        if marker in text:
+            after = text.split(marker, 1)[1]
+            break
+
+    if not after:
         return []
 
-    after = text.split(marker, 1)[1]
     for stop in ["\n\nQuestion:", "\nQuestion:"]:
         if stop in after:
             after = after.split(stop, 1)[0]
             break
 
-    lines = [line.strip() for line in after.splitlines()]
-    return [line for line in lines if line]
+    lines = []
+    for line in after.splitlines():
+        line = line.strip()
+        line = line.strip(" -\t")
+        if not line:
+            continue
+        if line.lower().startswith("no retrieved graph evidence"):
+            continue
+        lines.append(line)
+
+    return lines
 
 
 def _average_path_length(paths: Iterable[str]) -> float:
@@ -153,6 +172,9 @@ def build_graphrag_frame(
                 "n_reasoning_paths": int(len(paths)),
                 "avg_reasoning_path_length": _average_path_length(paths),
                 "graph_context_chars": int(sum(len(path) for path in paths)),
+                "policy_name": row.get("policy_name", ""),
+                "policy": json.dumps(row.get("policy", {}), ensure_ascii=False),
+                "policy_diagnostics": json.dumps(row.get("policy_diagnostics", {}), ensure_ascii=False),
             }
         )
 
