@@ -103,3 +103,37 @@ def test_bbq_official_target_metadata_overrides_fallback(tmp_path):
     )
     assert int(result.loc[0, "target_loc"]) == 1
     assert result.loc[0, "target_loc_source"] == "official"
+
+
+def test_bbq_strict_mode_drops_complete_unscored_template_group(tmp_path):
+    from src.fairness.bbq import attach_official_target_locations
+
+    metadata_path = tmp_path / "additional_metadata.csv"
+    pd.DataFrame(
+        {
+            "category": ["Age", "Age", "Age"],
+            "example_id": [0, 1, 4],
+            "target_loc": [1, np.nan, 2],
+        }
+    ).to_csv(metadata_path, index=False)
+
+    frame = pd.DataFrame(
+        {
+            "category": ["Age", "Age", "Age"],
+            "question_index": ["q0", "q0", "q1"],
+            "example_id": [0, 1, 4],
+            "template_id": ["Age:0", "Age:0", "Age:1"],
+            "target_loc": [0, 0, 0],
+        }
+    )
+
+    result = attach_official_target_locations(
+        frame,
+        cache_path=metadata_path,
+        require_official=True,
+    )
+
+    assert result["example_id"].tolist() == [4]
+    assert result["template_id"].tolist() == ["Age:1"]
+    assert result["target_loc"].tolist() == [2]
+    assert result["target_loc_source"].tolist() == ["official"]

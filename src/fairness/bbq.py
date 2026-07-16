@@ -285,8 +285,9 @@ def attach_official_target_locations(
     documented unique merge key.  The conservative inference from
     :func:`prepare_bbq_dataframe` is retained only as an explicit offline fallback.
 
-    Set ``require_official=True`` for publication runs to fail closed when the
-    official metadata cannot be obtained or does not cover every selected row.
+    Set ``require_official=True`` for publication runs. Rows without an
+    official target are excluded as complete template groups, so strict runs
+    never substitute heuristic target labels and preserve grouped BBQ units.
     """
 
     out = df.copy()
@@ -312,11 +313,25 @@ def attach_official_target_locations(
             official["target_loc"], errors="coerce"
         )
 
-        if official["target_loc"].isna().any():
-            bad_rows = int(official["target_loc"].isna().sum())
-            raise ValueError(
-                f"Official BBQ metadata contains {bad_rows} rows without target_loc"
+        missing_official_targets = official["target_loc"].isna()
+        if missing_official_targets.any():
+            missing_count = int(missing_official_targets.sum())
+            missing_sample = (
+                official.loc[
+                    missing_official_targets,
+                    ["category", "example_id"],
+                ]
+                .head(20)
+                .to_dict(orient="records")
             )
+            logger.warning(
+                "Official BBQ metadata contains %d unscored rows without "
+                "target_loc; these keys cannot be used in strict mode. sample=%s",
+                missing_count,
+                missing_sample,
+            )
+            official = official.loc[~missing_official_targets].copy()
+
         official["target_loc"] = official["target_loc"].astype(int)
         invalid_targets = ~official["target_loc"].isin(LABEL_TO_INDEX.values())
         if invalid_targets.any():
@@ -365,18 +380,57 @@ def attach_official_target_locations(
             missing_rows = int((~covered).sum())
             diagnostic_columns = [
                 column
-                for column in ("category", "question_index", "example_id")
+                for column in (
+                    "category",
+                    "question_index",
+                    "example_id",
+                    "template_id",
+                )
                 if column in out.columns
             ]
-            sample = (
+            missing_sample = (
                 out.loc[~covered, diagnostic_columns]
                 .head(20)
                 .to_dict(orient="records")
             )
-            raise ValueError(
-                f"Official BBQ metadata covered {coverage:.2%}; "
-                f"{missing_rows} rows are missing; sample={sample}"
+
+            # BBQ splitting is grouped by template_id. Remove every row from a
+            # template containing an officially unscored example rather than
+            # creating an incomplete template or using a heuristic target.
+            if "template_id" in out.columns:
+                missing_groups = set(
+                    out.loc[~covered, "template_id"].dropna().astype(str)
+                )
+                drop_mask = out["template_id"].astype(str).isin(missing_groups)
+                group_count = len(missing_groups)
+            else:
+                drop_mask = ~covered
+                group_count = missing_rows
+
+            dropped_rows = int(drop_mask.sum())
+            logger.warning(
+                "Strict BBQ mode is excluding %d rows across %d template "
+                "group(s) because %d row(s) lack official target_loc. sample=%s",
+                dropped_rows,
+                group_count,
+                missing_rows,
+                missing_sample,
             )
+            out = out.loc[~drop_mask].copy().reset_index(drop=True)
+            covered = out["official_target_loc"].notna()
+            coverage = float(covered.mean()) if len(out) else 1.0
+
+            if coverage < 1.0:
+                remaining = int((~covered).sum())
+                raise ValueError(
+                    "Strict BBQ filtering failed: "
+                    f"{remaining} retained rows still lack official target_loc"
+                )
+            if out.empty:
+                raise ValueError(
+                    "Strict BBQ filtering removed every row from the dataset"
+                )
+
         if coverage < 1.0:
             logger.warning(
                 "Official BBQ target metadata covered %.2f%%; using conservative fallback for %d rows",
