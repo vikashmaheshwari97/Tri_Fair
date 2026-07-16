@@ -83,7 +83,7 @@ def test_bbq_official_target_metadata_overrides_fallback(tmp_path):
     pd.DataFrame(
         {
             "category": ["Age"],
-            "question_index": ["1"],
+            "question_index": ["official-question-index"],
             "example_id": [0],
             "target_loc": [1],
         }
@@ -91,7 +91,7 @@ def test_bbq_official_target_metadata_overrides_fallback(tmp_path):
     frame = pd.DataFrame(
         {
             "category": ["Age"],
-            "question_index": ["1"],
+            "question_index": ["converted-question-index"],
             "example_id": [0],
             "target_loc": [0],
         }

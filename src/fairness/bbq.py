@@ -281,9 +281,9 @@ def attach_official_target_locations(
 
     The Hugging Face conversion does not expose the exact target-location file
     used by the BBQ authors.  Tri-Fair therefore downloads/caches the official
-    commit-pinned CSV and joins it on ``category``, ``question_index`` and
-    ``example_id``.  The conservative inference from :func:`prepare_bbq_dataframe`
-    is retained only as an explicit offline fallback.
+    commit-pinned CSV and joins it on ``category`` and ``example_id``, the
+    documented unique merge key.  The conservative inference from
+    :func:`prepare_bbq_dataframe` is retained only as an explicit offline fallback.
 
     Set ``require_official=True`` for publication runs to fail closed when the
     official metadata cannot be obtained or does not cover every selected row.
@@ -297,29 +297,61 @@ def attach_official_target_locations(
             logger.info("Downloading official BBQ metadata to %s", target_cache)
             _download_atomic(metadata_url, target_cache)
         official = pd.read_csv(target_cache, low_memory=False)
-        needed = {"category", "question_index", "example_id", "target_loc"}
+        needed = {"category", "example_id", "target_loc"}
         missing = needed - set(official.columns)
         if missing:
             raise ValueError(f"Official BBQ metadata is missing {sorted(missing)}")
 
+        key_columns = ["category", "example_id"]
         official = official.loc[:, sorted(needed)].copy()
-        official["category"] = official["category"].astype(str)
-        official["question_index"] = official["question_index"].astype(str)
+        official["category"] = official["category"].astype(str).str.strip()
         official["example_id"] = pd.to_numeric(
             official["example_id"], errors="raise"
         ).astype(int)
-        official["target_loc"] = pd.to_numeric(official["target_loc"], errors="coerce")
+        official["target_loc"] = pd.to_numeric(
+            official["target_loc"], errors="coerce"
+        )
+
+        if official["target_loc"].isna().any():
+            bad_rows = int(official["target_loc"].isna().sum())
+            raise ValueError(
+                f"Official BBQ metadata contains {bad_rows} rows without target_loc"
+            )
+        official["target_loc"] = official["target_loc"].astype(int)
+        invalid_targets = ~official["target_loc"].isin(LABEL_TO_INDEX.values())
+        if invalid_targets.any():
+            values = sorted(
+                official.loc[invalid_targets, "target_loc"].unique().tolist()
+            )
+            raise ValueError(
+                f"Official BBQ metadata contains invalid target_loc values: {values}"
+            )
+
+        # The official BBQ README documents category + example_id as the merge
+        # key. Duplicate rows are harmless only when their target locations agree.
+        target_counts = official.groupby(
+            key_columns, dropna=False
+        )["target_loc"].nunique(dropna=False)
+        conflicts = target_counts[target_counts > 1]
+        if len(conflicts):
+            sample = [list(value) for value in conflicts.index[:10]]
+            raise ValueError(
+                "Official BBQ metadata contains conflicting target_loc values for "
+                f"{len(conflicts)} category/example_id keys; sample={sample}"
+            )
+
         official = official.drop_duplicates(
-            subset=["category", "question_index", "example_id"], keep="first"
+            subset=key_columns, keep="first"
         ).rename(columns={"target_loc": "official_target_loc"})
 
-        out["category"] = out["category"].astype(str)
-        out["question_index"] = out["question_index"].astype(str)
-        out["example_id"] = pd.to_numeric(out["example_id"], errors="raise").astype(int)
+        out["category"] = out["category"].astype(str).str.strip()
+        out["example_id"] = pd.to_numeric(
+            out["example_id"], errors="raise"
+        ).astype(int)
         out = out.merge(
             official,
             how="left",
-            on=["category", "question_index", "example_id"],
+            on=key_columns,
             validate="many_to_one",
         )
         covered = out["official_target_loc"].notna()
@@ -331,8 +363,19 @@ def attach_official_target_locations(
         coverage = float(covered.mean()) if len(out) else 1.0
         if require_official and coverage < 1.0:
             missing_rows = int((~covered).sum())
+            diagnostic_columns = [
+                column
+                for column in ("category", "question_index", "example_id")
+                if column in out.columns
+            ]
+            sample = (
+                out.loc[~covered, diagnostic_columns]
+                .head(20)
+                .to_dict(orient="records")
+            )
             raise ValueError(
-                f"Official BBQ metadata covered {coverage:.2%}; {missing_rows} rows are missing"
+                f"Official BBQ metadata covered {coverage:.2%}; "
+                f"{missing_rows} rows are missing; sample={sample}"
             )
         if coverage < 1.0:
             logger.warning(
