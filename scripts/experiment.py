@@ -53,7 +53,7 @@ from src.gepa import Gepa
 from src.helpers.llm_creation import create_llm
 from src.helpers.task_creation import create_dev_tasks
 from src.nsgaii_po_fair import NSGAiiPOFair
-from src.tri_fair import TriFair
+from src.tri_fair import TRI_FAIR_METHOD_VERSION, TriFair
 from src.utils import copy_llm, generate_random_hash, seed_everything
 
 try:  # Supports both ``python -m scripts...`` and ``python scripts/...``.
@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", choices=sorted(ALL_MODELS), required=True)
     parser.add_argument("--optimizer", choices=sorted(ALL_OPTIMIZERS), required=True)
 
-    parser.add_argument("--n-init-prompts", type=int, default=6)
+    parser.add_argument("--n-init-prompts", type=int, default=12)
     parser.add_argument("--max-output-tokens", type=int, default=16)
     parser.add_argument("--meta-max-output-tokens", type=int, default=256)
     parser.add_argument(
@@ -124,6 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-few-shot-examples", type=int, default=None)
     parser.add_argument("--input-cost-multiplier", type=float, default=1.0)
     parser.add_argument("--output-cost-multiplier", type=float, default=1.0)
+    parser.add_argument("--fixed-cost-upper-bound", type=float, default=None)
+    parser.add_argument("--disable-objective-aware-variation", action="store_true")
 
     parser.add_argument(
         "--allow-under-budget-exit",
@@ -151,6 +153,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-few-shot-examples cannot be negative")
     if args.input_cost_multiplier < 0 or args.output_cost_multiplier < 0:
         raise ValueError("Cost multipliers cannot be negative")
+    if args.fixed_cost_upper_bound is not None and args.fixed_cost_upper_bound <= 0:
+        raise ValueError("--fixed-cost-upper-bound must be positive")
 
 
 def _resolve_logging_dir(args: argparse.Namespace) -> Path:
@@ -195,6 +199,8 @@ def _validate_resume_metadata(logging_dir: Path, args: argparse.Namespace) -> No
             "output_cost_multiplier",
             "crossovers_per_iteration",
             "max_few_shot_examples",
+            "fixed_cost_upper_bound",
+            "disable_objective_aware_variation",
         ),
     )
 
@@ -207,6 +213,10 @@ def _optimizer_parameters(
         params["crossovers_per_iter"] = int(args.crossovers_per_iteration)
     if args.max_few_shot_examples is not None:
         params["upper_shots"] = int(args.max_few_shot_examples)
+    if optimizer_config.optimizer in {"Tri-Fair", "NSGAII-PO-Fair"}:
+        params["objective_aware_variation"] = not bool(
+            args.disable_objective_aware_variation
+        )
     return params
 
 
@@ -263,6 +273,19 @@ def _build_optimizer(
             **params,
         )
     if name == "Tri-Fair":
+        configured_bound = task.fairness_kwargs.get(
+            "normalization_cost_upper_bound"
+        )
+        cost_upper_bound = (
+            args.fixed_cost_upper_bound
+            if args.fixed_cost_upper_bound is not None
+            else configured_bound
+        )
+        if cost_upper_bound is not None:
+            params["fixed_objective_bounds"] = (
+                (0.0, -float(cost_upper_bound), -1.0),
+                (1.0, 0.0, 0.0),
+            )
         return TriFair(
             **common,
             df_few_shots=df_fewshots,
@@ -460,6 +483,11 @@ def run(args: argparse.Namespace, *, logging_dir: Path | None = None) -> Path:
         "manifest_path": getattr(dev_task, "manifest_path", None),
         "logging_dir": str(logging_dir),
         "checkpoint_latest": str(logging_dir / "checkpoints" / "latest.pkl"),
+        "method_version": TRI_FAIR_METHOD_VERSION,
+        "fairness_metric": getattr(dev_task, "fairness_metric_name", None),
+        "fairness_kwargs": getattr(dev_task, "fairness_kwargs", None),
+        "population_size": len(initial_prompts),
+        "optimizer_parameters": _optimizer_parameters(args, optimizer_config),
     }
     atomic_write_json(logging_dir / "run_summary.json", summary)
     _write_stage_metadata(logging_dir, args, status="complete", extra=summary)

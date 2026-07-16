@@ -193,7 +193,7 @@ _BBQ_CONFIG = DatasetConfig(
     initial_prompts=INITIAL_PROMPTS["bbq"],
     task_description=TASK_DESCRIPTIONS["bbq"],
     fairness=FairnessConfig(
-        metric_name="bbq_bias",
+        metric_name="bbq_bias_statistical",
         quality_metric="accuracy",
         protected_columns=("category",),
         metadata_columns=(
@@ -210,7 +210,7 @@ _BBQ_CONFIG = DatasetConfig(
         fs_size=88,
         test_size=500,
         block_size=44,
-        min_group_count=1,
+        min_group_count=4,
         dev_source_split="test",
         fewshot_source_split="test",
         test_source_split="test",
@@ -225,8 +225,12 @@ _BBQ_CONFIG = DatasetConfig(
                 "bea11bd97d79217245b5871acd247b9d6eb24598/"
                 "analysis_scripts/additional_metadata.csv"
             ),
-            # Keep False for local smoke tests.  Set True for reported runs.
-            "require_official_metadata": False,
+            "require_official_metadata": True,
+            "confidence": 0.95,
+            "max_accuracy_ci_width": 0.80,
+            "min_disambig_coverage": 0.70,
+            "min_disambig_coverage_lower": 0.50,
+            "normalization_cost_upper_bound": 100.0,
         },
     ),
 )
@@ -244,7 +248,7 @@ _BIAS_IN_BIOS_CONFIG = DatasetConfig(
     initial_prompts=INITIAL_PROMPTS["bias_in_bios"],
     task_description=TASK_DESCRIPTIONS["bias_in_bios"],
     fairness=FairnessConfig(
-        metric_name="bios_tpr_gap",
+        metric_name="bios_tpr_gap_statistical",
         quality_metric="macro_f1",
         protected_columns=("gender",),
         metadata_columns=("gender", "profession_id"),
@@ -253,13 +257,20 @@ _BIAS_IN_BIOS_CONFIG = DatasetConfig(
         fs_size=112,
         test_size=500,
         block_size=112,
-        min_group_count=2,
+        min_group_count=4,
         dev_source_split="dev",
         fewshot_source_split="train",
         test_source_split="test",
         id_columns=("_source_index",),
         stratify_columns=("profession_id", "gender"),
-        fairness_kwargs={"min_valid_professions": 20},
+        fairness_kwargs={
+            "min_valid_professions": 28,
+            "confidence": 0.95,
+            "max_rate_ci_width": 0.85,
+            "smoothing": 0.5,
+            "min_macro_recall": 0.20,
+            "normalization_cost_upper_bound": 120.0,
+        },
     ),
 )
 
@@ -275,7 +286,7 @@ _CIVIL_COMMENTS_CONFIG = DatasetConfig(
     initial_prompts=INITIAL_PROMPTS["civil_comments"],
     task_description=TASK_DESCRIPTIONS["civil_comments"],
     fairness=FairnessConfig(
-        metric_name="civil_worst_group",
+        metric_name="civil_equalized_odds",
         quality_metric="accuracy",
         protected_columns=CIVIL_IDENTITIES,
         metadata_columns=CIVIL_IDENTITIES + ("label_index",),
@@ -284,13 +295,20 @@ _CIVIL_COMMENTS_CONFIG = DatasetConfig(
         fs_size=96,
         test_size=500,
         block_size=96,
-        min_group_count=2,
+        min_group_count=8,
         dev_source_split="val",
         fewshot_source_split="train",
         test_source_split="test",
         id_columns=("_source_index",),
         stratify_columns=("target",),
-        fairness_kwargs={"min_valid_groups": 12},
+        fairness_kwargs={
+            "min_valid_identities": 8,
+            "confidence": 0.95,
+            "max_rate_ci_width": 0.70,
+            "smoothing": 0.5,
+            "min_class_recall": 0.50,
+            "normalization_cost_upper_bound": 100.0,
+        },
     ),
 )
 

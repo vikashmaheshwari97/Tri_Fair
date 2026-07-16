@@ -10,6 +10,10 @@ from promptolution.utils.prompt import Prompt
 from src.nsgaii_po import NSGAiiPO
 from src.checkpointing import ResumableOptimizerMixin
 from src.tasks.fairness_task import FairnessEvalResult, FairnessTask
+from src.fairness.objective_mutation import (
+    DEFAULT_MUTATION_WEIGHTS,
+    generate_objective_aware_challengers,
+)
 
 
 class NSGAiiPOFair(ResumableOptimizerMixin, NSGAiiPO):
@@ -22,12 +26,27 @@ class NSGAiiPOFair(ResumableOptimizerMixin, NSGAiiPO):
 
     supports_multi_objective = True
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        objective_aware_variation: bool = True,
+        objective_mutation_weights: Optional[Dict[str, float]] = None,
+        **kwargs,
+    ) -> None:
+        self.objective_aware_variation = bool(objective_aware_variation)
+        self.objective_mutation_weights = dict(
+            objective_mutation_weights or DEFAULT_MUTATION_WEIGHTS
+        )
         super().__init__(*args, **kwargs)
         if not isinstance(self.task, FairnessTask):
             raise TypeError("NSGAiiPOFair requires FairnessTask")
         self.n_objectives = 3
         self.current_step = 0
+
+    def _generate_challengers(self):
+        if not self.objective_aware_variation:
+            return super()._generate_challengers()
+        return generate_objective_aware_challengers(self)
 
     def _get_objective_vectors(self, result: FairnessEvalResult) -> np.ndarray:
         quality = np.asarray(result.agg_scores, dtype=float).reshape(-1, 1)

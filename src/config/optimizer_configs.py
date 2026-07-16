@@ -1,4 +1,4 @@
-"""Optimizer configurations for MO-CAPO and the 1M Tri-Fair stage."""
+"""Optimizer configurations for MO-CAPO and statistical Tri-Fair v2."""
 
 from __future__ import annotations
 
@@ -46,10 +46,18 @@ _TRI_FAIR_CONFIG = OptimizerConfig(
     name="Tri-Fair",
     optimizer="Tri-Fair",
     optimizer_params={
-        "crossovers_per_iter": 2,
+        "crossovers_per_iter": 4,
         "upper_shots": 3,
         "check_fs_accuracy": True,
         "create_fs_reasoning": True,
+        "objective_aware_variation": True,
+        "objective_mutation_weights": {
+            "fairness": 0.35,
+            "quality": 0.25,
+            "cost": 0.20,
+            "balanced": 0.15,
+            "explore": 0.05,
+        },
     },
     eval_strategy="sequential_block",
     n_subsamples=1,
@@ -58,10 +66,18 @@ _NSGAII_PO_FAIR_CONFIG = OptimizerConfig(
     name="NSGAII-PO-Fair",
     optimizer="NSGAII-PO-Fair",
     optimizer_params={
-        "crossovers_per_iter": 2,
+        "crossovers_per_iter": 4,
         "upper_shots": 3,
         "check_fs_accuracy": True,
         "create_fs_reasoning": True,
+        "objective_aware_variation": True,
+        "objective_mutation_weights": {
+            "fairness": 0.35,
+            "quality": 0.25,
+            "cost": 0.20,
+            "balanced": 0.15,
+            "explore": 0.05,
+        },
     },
     eval_strategy="full",
     n_subsamples=1,

@@ -43,7 +43,8 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 source jobs/lib/common.sh
 
 tf_validate_positive_int BUDGET "$budget"
-MANIFEST_DIR="${MANIFEST_DIR:-data/splits}"
+MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2}"
+TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 EVAL_INCUMBENTS="${EVAL_INCUMBENTS:-true}"
 FORCE_EVAL="${FORCE_EVAL:-0}"

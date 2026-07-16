@@ -17,6 +17,12 @@ from promptolution.utils.prompt import Prompt
 from src.mo_capo import MoCAPO
 from src.checkpointing import ResumableOptimizerMixin
 from src.tasks.fairness_task import FairnessEvalResult, FairnessTask
+from src.fairness.objective_mutation import (
+    DEFAULT_MUTATION_WEIGHTS,
+    generate_objective_aware_challengers,
+)
+
+TRI_FAIR_METHOD_VERSION = "2.0-statistical-objective-aware"
 
 
 class TriFair(ResumableOptimizerMixin, MoCAPO):
@@ -24,15 +30,46 @@ class TriFair(ResumableOptimizerMixin, MoCAPO):
 
     supports_multi_objective = True
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        fixed_objective_bounds: Optional[Sequence[Sequence[float]]] = None,
+        objective_aware_variation: bool = True,
+        objective_mutation_weights: Optional[Dict[str, float]] = None,
+        **kwargs,
+    ) -> None:
+        self.fixed_objective_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.objective_aware_variation = bool(objective_aware_variation)
+        self.objective_mutation_weights = dict(
+            objective_mutation_weights or DEFAULT_MUTATION_WEIGHTS
+        )
         super().__init__(*args, **kwargs)
         if not isinstance(self.task, FairnessTask):
             raise TypeError("TriFair requires src.tasks.fairness_task.FairnessTask")
         self.n_objectives = 3
         self.aggregate_records: Dict[Tuple[str, Tuple[int, ...]], Dict] = {}
 
+        if fixed_objective_bounds is not None:
+            bounds = np.asarray(fixed_objective_bounds, dtype=float)
+            if bounds.shape != (2, self.n_objectives):
+                raise ValueError(
+                    "fixed_objective_bounds must have shape (2, 3): lower then upper"
+                )
+            lower, upper = bounds
+            if not np.all(np.isfinite(bounds)) or np.any(upper <= lower):
+                raise ValueError("fixed objective bounds must be finite and strictly ordered")
+            self.fixed_objective_bounds = (lower.copy(), upper.copy())
+            self.global_min_bounds = lower.copy()
+            self.global_max_bounds = upper.copy()
+
     def _update_global_bounds(self, vectors: np.ndarray) -> None:
         """Track only fully finite objective vectors for stable normalization."""
+
+        if self.fixed_objective_bounds is not None:
+            lower, upper = self.fixed_objective_bounds
+            self.global_min_bounds = lower.copy()
+            self.global_max_bounds = upper.copy()
+            return
 
         values = np.atleast_2d(np.asarray(vectors, dtype=float))
         values = values[np.all(np.isfinite(values), axis=1)]
@@ -146,6 +183,11 @@ class TriFair(ResumableOptimizerMixin, MoCAPO):
             return {}
         return self._record_for(prompt, blocks)
 
+    def _generate_challengers(self) -> List[Prompt]:
+        if not self.objective_aware_variation:
+            return super()._generate_challengers()
+        return generate_objective_aware_challengers(self)
+
     def _ready_incumbent_vectors(
         self,
         incumbents: Sequence[Prompt],
@@ -179,7 +221,16 @@ class TriFair(ResumableOptimizerMixin, MoCAPO):
         old_vector: Optional[np.ndarray] = None
 
         while remaining:
-            block = random.choice(tuple(remaining))
+            diagnostics = (
+                self._record_for(challenger, challenger_blocks).get("diagnostics", {})
+                if challenger_blocks
+                else {}
+            )
+            block = self.task.select_fairness_block(
+                sorted(remaining),
+                current_blocks=challenger_blocks,
+                diagnostics=diagnostics,
+            )
             remaining.remove(block)
             challenger_blocks.append(block)
             challenger_blocks.sort()
@@ -227,6 +278,40 @@ class TriFair(ResumableOptimizerMixin, MoCAPO):
 
         self.incumbents.append(challenger)
         self._update_incumbent_front(blocks=list(common_blocks))
+
+    def _advance_one_incumbent(self) -> None:
+        if not self.incumbents:
+            return
+        blocks_map = self._get_evaluated_blocks(self.incumbents)
+        counts = [len(blocks_map[prompt]) for prompt in self.incumbents]
+        minimum = min(counts)
+        least = [
+            prompt for prompt, count in zip(self.incumbents, counts) if count == minimum
+        ]
+        chosen = random.choice(least)
+
+        union_blocks: set[int] = set()
+        for prompt in self.incumbents:
+            union_blocks.update(blocks_map[prompt])
+        chosen_blocks = list(blocks_map[chosen])
+        gap_blocks = union_blocks - set(chosen_blocks)
+        if gap_blocks:
+            candidates = sorted(gap_blocks)
+        else:
+            candidates = sorted(set(range(self.task.n_blocks)) - union_blocks)
+        if not candidates:
+            return
+        diagnostics = (
+            self._record_for(chosen, chosen_blocks).get("diagnostics", {})
+            if chosen_blocks
+            else {}
+        )
+        block = self.task.select_fairness_block(
+            candidates,
+            current_blocks=chosen_blocks,
+            diagnostics=diagnostics,
+        )
+        self._get_block_vectors([chosen], block)
 
     def _update_incumbent_front(self, blocks: List[int]) -> None:
         vectors = self._get_block_vectors(self.incumbents, blocks)

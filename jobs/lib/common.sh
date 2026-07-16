@@ -117,8 +117,9 @@ tf_repo_root() {
 
 tf_run_output_dir() {
   local root="$1" model="$2" dataset="$3" optimizer="$4" seed="$5"
-  printf '%s/results/tri_fair/%s/%s/%s/seed%s' \
-    "$root" "$model" "$dataset" "$optimizer" "$seed"
+  local namespace="${TF_RESULTS_NAMESPACE:-tri_fair}"
+  printf '%s/results/%s/%s/%s/%s/seed%s' \
+    "$root" "$namespace" "$model" "$dataset" "$optimizer" "$seed"
 }
 
 tf_read_logging_dir() {

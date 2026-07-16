@@ -9,7 +9,7 @@ exactly over any requested union of blocks without additional LLM calls.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,11 @@ from src.fairness.base import FairnessMetric, FairnessMetricResult, json_safe
 from src.fairness.bbq import compute_bbq_fairness
 from src.fairness.bios import compute_bios_fairness
 from src.fairness.civilcomments import compute_civilcomments_fairness
+from src.fairness.statistical_metrics import (
+    compute_bbq_statistical_fairness,
+    compute_bios_statistical_tpr_gap,
+    compute_civil_equalized_odds,
+)
 
 
 @dataclass
@@ -44,6 +49,9 @@ _METRICS: Dict[str, FairnessMetric] = {
     "bbq_bias": compute_bbq_fairness,
     "bios_tpr_gap": compute_bios_fairness,
     "civil_worst_group": compute_civilcomments_fairness,
+    "bbq_bias_statistical": compute_bbq_statistical_fairness,
+    "bios_tpr_gap_statistical": compute_bios_statistical_tpr_gap,
+    "civil_equalized_odds": compute_civil_equalized_odds,
 }
 
 
@@ -389,6 +397,83 @@ class FairnessTask(BaseTask):
             fairness_diagnostics=fairness_diagnostics,
             fairness_support=fairness_support,
         )
+
+    def _fairness_memberships_for_position(self, position: int) -> list[str]:
+        """Return metadata cells whose uncertainty is reduced by one row."""
+
+        row = self.df.iloc[int(position)]
+        label = str(self.ys[int(position)])
+        metric = str(self.fairness_metric_name)
+        if metric.startswith("bbq_bias"):
+            return [f"{row['category']}/{row['context_condition']}"]
+        if metric.startswith("bios_tpr_gap"):
+            gender = "female" if int(row["gender"]) == 1 else "male"
+            return [f"{label}/{gender}"]
+        if metric in {"civil_worst_group", "civil_equalized_odds"}:
+            memberships: list[str] = []
+            for identity in self.protected_columns:
+                present = int(row.get(identity, 0) or 0) == 1
+                side = "present" if present else "absent"
+                memberships.append(f"{identity}/{side}/{label}")
+            return memberships
+        return []
+
+    def fairness_support_profile(
+        self, block_indices: Sequence[int]
+    ) -> Dict[str, int]:
+        """Count protected-group evidence supplied by a set of blocks."""
+
+        profile: Dict[str, int] = {}
+        if not block_indices:
+            return profile
+        for position in self._positions_for_blocks(list(block_indices)):
+            for key in self._fairness_memberships_for_position(position):
+                profile[key] = profile.get(key, 0) + 1
+        return profile
+
+    def select_fairness_block(
+        self,
+        candidate_blocks: Sequence[int],
+        *,
+        current_blocks: Sequence[int] = (),
+        diagnostics: Optional[Mapping[str, Any]] = None,
+    ) -> int:
+        """Choose the block with the largest expected uncertainty reduction.
+
+        The estimate is prediction-free for unseen blocks: it uses their protected
+        group composition and upweights cells whose current Wilson intervals are
+        widest. Ties are broken by the task RNG for reproducible seeds.
+        """
+
+        candidates = sorted({int(value) for value in candidate_blocks})
+        if not candidates:
+            raise ValueError("candidate_blocks cannot be empty")
+        current = self.fairness_support_profile(list(current_blocks))
+        diag = dict(diagnostics or {})
+        raw_widths = diag.get("uncertainty_by_group") or {}
+        widths = {
+            str(key): float(value)
+            for key, value in raw_widths.items()
+            if value is not None
+        }
+
+        scores: Dict[int, float] = {}
+        for block in candidates:
+            added = self.fairness_support_profile([block])
+            score = 0.0
+            for key, increment in added.items():
+                before = int(current.get(key, 0))
+                after = before + int(increment)
+                uncertainty = max(1e-6, float(widths.get(key, 1.0)))
+                reduction = 1.0 / np.sqrt(before + 1.0) - 1.0 / np.sqrt(after + 1.0)
+                score += uncertainty * reduction
+                if before < self.min_group_count <= after:
+                    score += uncertainty
+            scores[block] = float(score)
+
+        best = max(scores.values())
+        tied = [block for block, score in scores.items() if np.isclose(score, best)]
+        return int(self.rng.choice(tied))
 
     def get_evaluated_blocks(
         self, prompts: Union[Prompt, Sequence[Prompt]]

@@ -166,12 +166,17 @@ class MoCAPO(BaseOptimizer):
         # keep self.prompts as a "view" if base class expects it
         self.scores = initial_vectors.tolist()
 
+    def _generate_challengers(self) -> List[Prompt]:
+        """Generate challengers; fairness subclasses may override this operator."""
+
+        offsprings = perform_crossover(self.prompts, self, self._tournament_selection)
+        return perform_mutation(offsprings, self)
+
     def _step(self) -> List[Prompt]:
         self.current_step += 1  # Increment step counter
 
         # 1) generate challengers
-        offsprings = perform_crossover(self.prompts, self, self._tournament_selection)
-        new_challengers = perform_mutation(offsprings, self)
+        new_challengers = self._generate_challengers()
 
         # 2) intensify each challenger; after each, advance incumbents + prune
         for challenger in new_challengers:

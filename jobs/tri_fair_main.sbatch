@@ -39,10 +39,13 @@ TF_SEEDS="${TF_SEEDS:-42,43,44}"
 BUDGET="${BUDGET:-1000000}"
 RUN_MODE="${RUN_MODE:-auto}"
 AUTO_EVAL="${AUTO_EVAL:-1}"
-MANIFEST_DIR="${MANIFEST_DIR:-data/splits}"
+MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 META_MAX_OUTPUT_TOKENS="${META_MAX_OUTPUT_TOKENS:-256}"
-N_INIT_PROMPTS="${N_INIT_PROMPTS:-6}"
+N_INIT_PROMPTS="${N_INIT_PROMPTS:-12}"
+TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2}"
+OBJECTIVE_AWARE_VARIATION="${OBJECTIVE_AWARE_VARIATION:-1}"
+FIXED_COST_UPPER_BOUND="${FIXED_COST_UPPER_BOUND:-}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 FORCE_FRESH="${FORCE_FRESH:-0}"
 
@@ -164,14 +167,23 @@ else
   fi
 fi
 
-declare -a PYTHON_CMD
+declare -a PYTHON_CMD objective_variation_args fixed_bound_args
 tf_python_command PYTHON_CMD
+objective_variation_args=()
+if ! tf_is_true "$OBJECTIVE_AWARE_VARIATION"; then
+  objective_variation_args=(--disable-objective-aware-variation)
+fi
+fixed_bound_args=()
+if [[ -n "$FIXED_COST_UPPER_BOUND" ]]; then
+  fixed_bound_args=(--fixed-cost-upper-bound "$FIXED_COST_UPPER_BOUND")
+fi
 
 tf_log "============================================================"
 tf_log "Tri-Fair optimization task"
 tf_log "job=${SLURM_JOB_ID:-local} array_task=$task_id/$total"
 tf_log "model=$model dataset=$dataset optimizer=$optimizer seed=$seed"
 tf_log "budget=$BUDGET checkpoints=$checkpoints mode=$resolved_mode"
+tf_log "namespace=$TF_RESULTS_NAMESPACE population=$N_INIT_PROMPTS objective_aware=$OBJECTIVE_AWARE_VARIATION"
 tf_log "output_dir=$output_dir"
 tf_log "============================================================"
 
@@ -189,6 +201,8 @@ tf_log "============================================================"
   --meta-max-output-tokens "$META_MAX_OUTPUT_TOKENS" \
   --manifest-dir "$MANIFEST_DIR" \
   --max-steps "$MAX_STEPS" \
+  "${objective_variation_args[@]}" \
+  "${fixed_bound_args[@]}" \
   "${resume_args[@]}"
 
 logging_dir="$(tf_read_logging_dir "$output_dir")" \

@@ -105,9 +105,8 @@ class NSGAiiPO(MoCAPO):
 
     def _step(self) -> List[Prompt]:
         """Execute one generation of NSGA-II: crossover, mutation, evaluation, and environmental selection."""
-        # Generate offspring through crossover and mutation
-        offsprings = perform_crossover(self.prompts, self, self._tournament_selection)
-        new_challengers = perform_mutation(offsprings, self)
+        # Generate offspring through the overridable variation operator.
+        new_challengers = self._generate_challengers()
 
         # Combine parent and offspring populations
         candidates = self.prompts + new_challengers
