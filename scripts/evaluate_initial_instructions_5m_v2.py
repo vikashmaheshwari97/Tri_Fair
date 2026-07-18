@@ -1,9 +1,14 @@
-"""Evaluate the exact 12-prompt initial populations used by the 5M v2 study.
+"""Evaluate the exact deterministic 12-instruction baseline for the 5M v2 study.
 
-For each dataset/seed pair this script recovers the initial population from the
-completed Tri-Fair and NSGAII-PO-Fair 5M runs, verifies that both optimizers used
-the same prompt set, and evaluates those prompts on the full immutable v2
-development and test manifests.
+For each dataset/seed pair this script validates the completed Tri-Fair and
+NSGAII-PO-Fair 5M runs, reconstructs the submitted initial instruction sample
+with the same ``random.Random(seed).sample(...)`` protocol used by
+``scripts.experiment``, and evaluates those instructions on the full immutable
+v2 development and test manifests.
+
+``step_results.parquet`` is deliberately not used to recover the initial
+population. Its first callback row is an optimizer state after variation and
+may legitimately differ between Tri-Fair and NSGAII-PO-Fair.
 
 The baseline is written to:
 
@@ -19,12 +24,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import traceback
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 from promptolution.predictors import MarkerBasedPredictor
+from promptolution.utils import Prompt
 
 from src.config.dataset_configs import ALL_DATASETS
 from src.config.model_configs import ALL_MODELS
@@ -41,12 +48,10 @@ try:
         configure_logging,
         directory_lock,
         manifest_lock_path,
-        prompt_id,
-        reconstruct_prompts,
+        prompts_to_frame,
         resolve_manifest_path,
         set_generation_limit,
         sha256_file,
-        stable_latest_per_prompt,
         utc_now_iso,
     )
 except ModuleNotFoundError:  # pragma: no cover
@@ -57,12 +62,10 @@ except ModuleNotFoundError:  # pragma: no cover
         configure_logging,
         directory_lock,
         manifest_lock_path,
-        prompt_id,
-        reconstruct_prompts,
+        prompts_to_frame,
         resolve_manifest_path,
         set_generation_limit,
         sha256_file,
-        stable_latest_per_prompt,
         utc_now_iso,
     )
 
@@ -75,15 +78,6 @@ DEFAULT_MODEL = "qwen-3-30b"
 DEFAULT_SOURCE_BUDGET = 5_000_000
 DEFAULT_SOURCE_OPTIMIZERS = ("Tri-Fair", "NSGAII-PO-Fair")
 DEFAULT_EXPECTED_INITIAL_PROMPTS = 12
-
-PROMPT_COLUMNS = (
-    "prompt",
-    "prompt_id",
-    "instruction",
-    "few_shots_json",
-    "downstream_template",
-    "prompt_order",
-)
 
 
 def parse_csv(raw: str | Iterable[str]) -> tuple[str, ...]:
@@ -205,77 +199,77 @@ def validate_source_stage(
     return logging_dir, stage, evaluation
 
 
-def initial_population(run_dir: Path) -> tuple[pd.DataFrame, int]:
-    path = run_dir / "step_results.parquet"
-    require_file(path)
-    frame = pd.read_parquet(path)
-
-    required = {"step", "prompt"}
-    missing = required - set(frame.columns)
-    if missing:
-        raise RuntimeError(f"{path} lacks required columns: {sorted(missing)}")
-    if frame.empty:
-        raise RuntimeError(f"{path} is empty")
-
-    work = frame.copy()
-    work["step"] = pd.to_numeric(work["step"], errors="raise").astype(int)
-    initial_step = int(work["step"].min())
-    selected = work[work["step"] == initial_step].copy()
-
-    if "prompt_id" not in selected:
-        selected["prompt_id"] = selected["prompt"].astype(str).map(prompt_id)
-
-    selected = stable_latest_per_prompt(selected)
-    sort_columns = [
-        column
-        for column in ("prompt_order", "prompt_id")
-        if column in selected
-    ]
-    if sort_columns:
-        selected = selected.sort_values(sort_columns, kind="stable")
-
-    keep = [column for column in PROMPT_COLUMNS if column in selected]
-    selected = selected[keep].copy()
-
-    if "prompt_order" not in selected:
-        selected["prompt_order"] = range(len(selected))
-
-    return selected.reset_index(drop=True), initial_step
-
-
-def verify_shared_initial_population(
-    populations: dict[str, pd.DataFrame],
+def validate_source_protocol(
+    logging_dir: Path,
     *,
+    model: str,
+    dataset: str,
+    optimizer: str,
+    seed: int,
+    source_budget: int,
+    expected_initial_prompts: int,
+) -> dict[str, object]:
+    """Validate the protocol recorded by a completed source run."""
+
+    args_path = logging_dir / "args.json"
+    source_args = read_json(args_path)
+
+    checks = {
+        "model": model,
+        "dataset": dataset,
+        "optimizer": optimizer,
+        "random_seed": seed,
+        "budget_per_run": source_budget,
+        "n_init_prompts": expected_initial_prompts,
+    }
+
+    for key, expected in checks.items():
+        observed = source_args.get(key)
+        if str(observed) != str(expected):
+            raise RuntimeError(
+                f"{args_path}: {key}={observed!r}, expected {expected!r}"
+            )
+
+    return source_args
+
+
+def deterministic_initial_population(
+    *,
+    dataset: str,
+    seed: int,
     expected_count: int,
-) -> None:
-    if not populations:
-        raise RuntimeError("No source optimizer populations were loaded")
+) -> tuple[pd.DataFrame, list[Prompt]]:
+    """Reproduce the exact instruction sample submitted to both optimizers."""
 
-    reference_optimizer = next(iter(populations))
-    reference = populations[reference_optimizer]
-    reference_ids = set(reference["prompt_id"].astype(str))
+    configured = [str(value) for value in ALL_DATASETS[dataset].initial_prompts]
 
-    if len(reference) != expected_count or len(reference_ids) != expected_count:
+    if expected_count > len(configured):
         raise RuntimeError(
-            f"{reference_optimizer} initial population has {len(reference)} rows and "
-            f"{len(reference_ids)} unique prompts; expected exactly {expected_count}"
+            f"Dataset {dataset!r} contains only {len(configured)} configured "
+            f"initial prompts, but {expected_count} were requested"
         )
 
-    for optimizer, frame in populations.items():
-        ids = set(frame["prompt_id"].astype(str))
-        if len(frame) != expected_count or len(ids) != expected_count:
-            raise RuntimeError(
-                f"{optimizer} initial population has {len(frame)} rows and "
-                f"{len(ids)} unique prompts; expected exactly {expected_count}"
-            )
-        if ids != reference_ids:
-            only_reference = sorted(reference_ids - ids)[:3]
-            only_current = sorted(ids - reference_ids)[:3]
-            raise RuntimeError(
-                "The two optimizers did not use the same initial population: "
-                f"reference={reference_optimizer}, optimizer={optimizer}, "
-                f"reference_only={only_reference}, optimizer_only={only_current}"
-            )
+    if len(configured) != len(set(configured)):
+        raise RuntimeError(
+            f"Dataset {dataset!r} contains duplicate configured initial prompts"
+        )
+
+    instructions = random.Random(int(seed)).sample(configured, int(expected_count))
+    prompts = [Prompt(instruction=value) for value in instructions]
+    selected = prompts_to_frame(prompts)
+
+    observed_ids = set(selected["prompt_id"].astype(str))
+    if len(selected) != expected_count or len(observed_ids) != expected_count:
+        raise RuntimeError(
+            f"Deterministic initial population has {len(selected)} rows and "
+            f"{len(observed_ids)} unique prompts; expected {expected_count}"
+        )
+
+    selected["selection_source"] = (
+        "random.Random(seed).sample(dataset_config.initial_prompts, n_init_prompts)"
+    )
+    return selected.reset_index(drop=True), prompts
+
 
 
 def output_dir(
@@ -326,8 +320,8 @@ def validate_existing_output(
         )
     if observed_prompt_ids != expected_prompt_ids:
         raise RuntimeError(
-            f"Existing baseline {eval_path} does not contain the exact initial "
-            "population recovered from the completed 5M runs"
+            f"Existing baseline {eval_path} does not contain the exact "
+            "deterministically reconstructed submitted initial population"
         )
 
     checks = {
@@ -381,10 +375,9 @@ def evaluate(
     expected_manifest_hash = sha256_file(manifest_path)
 
     source_optimizers = parse_csv(args.source_optimizers)
-    populations: dict[str, pd.DataFrame] = {}
     source_dirs: dict[str, Path] = {}
-    source_steps: dict[str, int] = {}
     source_status: dict[str, dict[str, object]] = {}
+    source_protocols: dict[str, dict[str, object]] = {}
 
     for optimizer in source_optimizers:
         source_output = source_output_dir(
@@ -402,28 +395,33 @@ def evaluate(
             seed=args.random_seed,
             source_budget=args.source_budget,
         )
-        population, initial_step = initial_population(logging_dir)
-        populations[optimizer] = population
+        source_protocols[optimizer] = validate_source_protocol(
+            logging_dir,
+            model=args.model,
+            dataset=args.dataset,
+            optimizer=optimizer,
+            seed=args.random_seed,
+            source_budget=args.source_budget,
+            expected_initial_prompts=args.expected_initial_prompts,
+        )
         source_dirs[optimizer] = logging_dir
-        source_steps[optimizer] = initial_step
         source_status[optimizer] = {
             "stage": stage_status,
             "evaluation": eval_status,
         }
 
-    verify_shared_initial_population(
-        populations,
-        expected_count=args.expected_initial_prompts,
-    )
-
     preferred = args.preferred_optimizer
-    if preferred not in populations:
+    if preferred not in source_dirs:
         raise ValueError(
             f"--preferred-optimizer={preferred!r} is not present in "
             f"--source-optimizers={source_optimizers}"
         )
 
-    selected = populations[preferred].copy()
+    selected, prompts = deterministic_initial_population(
+        dataset=args.dataset,
+        seed=args.random_seed,
+        expected_count=args.expected_initial_prompts,
+    )
     baseline_dir = output_dir(
         results_root,
         model=args.model,
@@ -477,7 +475,17 @@ def evaluate(
         "source_budget": args.source_budget,
         "source_optimizers": list(source_optimizers),
         "source_run_dirs": {key: str(value) for key, value in source_dirs.items()},
-        "source_initial_steps": source_steps,
+        "source_protocol": {
+            key: {
+                "random_seed": value.get("random_seed"),
+                "n_init_prompts": value.get("n_init_prompts"),
+                "budget_per_run": value.get("budget_per_run"),
+            }
+            for key, value in source_protocols.items()
+        },
+        "initial_population_strategy": (
+            "random.Random(seed).sample(dataset_config.initial_prompts, n_init_prompts)"
+        ),
         "expected_initial_prompts": args.expected_initial_prompts,
         "manifest_path": str(manifest_path),
         "manifest_sha256": expected_manifest_hash,
@@ -516,7 +524,6 @@ def evaluate(
                 regenerate_manifest=False,
             )
 
-        prompts = reconstruct_prompts(selected)
         seed_everything(args.random_seed)
         llm = create_llm(model_config=model_config, seed=args.random_seed)
         set_generation_limit(llm, args.max_output_tokens)
@@ -571,14 +578,17 @@ def evaluate(
         output["comparison_budget"] = int(args.source_budget)
         output["source_budget"] = int(args.source_budget)
         output["actual_budget_tokens"] = 0
-        output["selection_policy"] = "exact_5m_optimizer_initial_population"
+        output["selection_policy"] = "deterministic_submitted_initial_population"
         output["run_key"] = (
             f"initial/{args.model}/{args.dataset}/seed{args.random_seed}/"
             f"source_budget{args.source_budget}"
         )
         output["run_dir"] = str(baseline_dir)
         output["source_run_dir"] = str(source_dirs[preferred])
-        output["source_initial_step"] = int(source_steps[preferred])
+        output["source_initial_step"] = 0
+        output["source_population_strategy"] = (
+            "random.Random(seed).sample(dataset_config.initial_prompts, n_init_prompts)"
+        )
         output["evaluation_timestamp"] = utc_now_iso()
         output["manifest_path"] = str(manifest_path)
         output["manifest_sha256"] = expected_manifest_hash
@@ -598,7 +608,19 @@ def evaluate(
                     key: str(value)
                     for key, value in source_dirs.items()
                 },
-                "source_initial_steps": source_steps,
+                "source_protocol": {
+                    key: {
+                        "random_seed": value.get("random_seed"),
+                        "n_init_prompts": value.get("n_init_prompts"),
+                        "budget_per_run": value.get("budget_per_run"),
+                    }
+                    for key, value in source_protocols.items()
+                },
+                "initial_population_strategy": (
+                    "random.Random(seed).sample("
+                    "dataset_config.initial_prompts, n_init_prompts)"
+                ),
+                "sampled_prompt_ids": selected["prompt_id"].astype(str).tolist(),
             },
         )
         atomic_write_json(
@@ -612,6 +634,10 @@ def evaluate(
                 "seed": args.random_seed,
                 "comparison_budget": args.source_budget,
                 "n_prompts": len(output),
+                "initial_population_strategy": (
+                    "random.Random(seed).sample("
+                    "dataset_config.initial_prompts, n_init_prompts)"
+                ),
                 "dev_ready": int(
                     output["dev_fairness_ready"].fillna(False).astype(bool).sum()
                 ),
@@ -694,7 +720,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-optimizers",
         default=",".join(DEFAULT_SOURCE_OPTIMIZERS),
-        help="Optimizers whose step-one initial populations must match.",
+        help=(
+            "Completed optimizers whose recorded run protocol must match the "
+            "requested deterministic initial-population protocol."
+        ),
     )
     parser.add_argument(
         "--preferred-optimizer",
