@@ -1,0 +1,24 @@
+{
+  "coordinate_order": [
+    "quality_loss",
+    "cost",
+    "unfairness"
+  ],
+  "created_at_utc": "2026-07-18T13:16:00.302752+00:00",
+  "entries": {
+    "bias_in_bios/qwen-3-30b": {
+      "maximum": [
+        1.0,
+        120.0,
+        1.0
+      ],
+      "minimum": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "source": "bias_in_bios_v2_fixed_objective_bounds"
+    }
+  },
+  "version": 1
+}
