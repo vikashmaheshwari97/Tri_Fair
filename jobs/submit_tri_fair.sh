@@ -17,12 +17,16 @@ export BUDGET="${BUDGET:-1000000}"
 export RUN_MODE="${RUN_MODE:-auto}"       # auto | fresh | resume
 export AUTO_EVAL="${AUTO_EVAL:-1}"
 export MAX_CONCURRENT="${MAX_CONCURRENT:-3}"
-export MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2}"
+export MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2_2}"
 export MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 export META_MAX_OUTPUT_TOKENS="${META_MAX_OUTPUT_TOKENS:-256}"
 export N_INIT_PROMPTS="${N_INIT_PROMPTS:-12}"
-export TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2}"
+export TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2_3}"
 export MAX_STEPS="${MAX_STEPS:-2000}"
+export STRICT_TOKEN_BUDGET="${STRICT_TOKEN_BUDGET:-1}"
+export NEAR_BUDGET_FRACTION="${NEAR_BUDGET_FRACTION:-0.90}"
+export MIN_BUDGET_UTILIZATION="${MIN_BUDGET_UTILIZATION:-0.95}"
+export OUTPUT_TOKEN_RESERVE="${OUTPUT_TOKEN_RESERVE:-2}"
 export FORCE_FRESH="${FORCE_FRESH:-0}"
 export DRY_RUN="${DRY_RUN:-0}"
 export ALLOW_PARTIAL_RESUME="${ALLOW_PARTIAL_RESUME:-0}"
@@ -83,7 +87,7 @@ array_spec="0-$((total - 1))%$MAX_CONCURRENT"
 SBATCH_ARGS=(
   --parsable
   "--array=$array_spec"
-  "--job-name=tfv2-${BUDGET}"
+  "--job-name=tfv23-${BUDGET}"
 )
 [[ -n "${PARTITION:-}" ]] && SBATCH_ARGS+=("--partition=$PARTITION")
 [[ -n "${QOS:-}" ]] && SBATCH_ARGS+=("--qos=$QOS")
@@ -104,6 +108,10 @@ printf '  namespace:    %s\n' "$TF_RESULTS_NAMESPACE"
 printf '  init prompts: %s\n' "$N_INIT_PROMPTS"
 printf '  mode:         %s\n' "$RUN_MODE"
 printf '  auto eval:    %s\n' "$AUTO_EVAL"
+printf '  strict budget:%s\n' "$STRICT_TOKEN_BUDGET"
+printf '  near mode:    %s\n' "$NEAR_BUDGET_FRACTION"
+printf '  min utilize:  %s\n' "$MIN_BUDGET_UTILIZATION"
+printf '  output reserve:%s\n' "$OUTPUT_TOKEN_RESERVE"
 printf '  array:        %s (%d tasks)\n' "$array_spec" "$total"
 
 if tf_is_true "$DRY_RUN"; then
@@ -121,7 +129,11 @@ tf_write_status_json "$manifest" \
   run_mode "$RUN_MODE" models "$TF_MODELS" datasets "$TF_DATASETS" \
   optimizers "$TF_OPTIMIZERS" seeds "$TF_SEEDS" array "$array_spec" \
   max_concurrent "$MAX_CONCURRENT" auto_eval "$AUTO_EVAL" \
-  results_namespace "$TF_RESULTS_NAMESPACE" n_init_prompts "$N_INIT_PROMPTS"
+  results_namespace "$TF_RESULTS_NAMESPACE" n_init_prompts "$N_INIT_PROMPTS" \
+  strict_token_budget "$STRICT_TOKEN_BUDGET" \
+  near_budget_fraction "$NEAR_BUDGET_FRACTION" \
+  minimum_budget_utilization "$MIN_BUDGET_UTILIZATION" \
+  output_token_reserve "$OUTPUT_TOKEN_RESERVE"
 
 tf_log "Submitted Tri-Fair array job $job_id"
 tf_log "Submission manifest: $manifest"

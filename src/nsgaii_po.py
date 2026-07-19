@@ -20,6 +20,7 @@ from promptolution.utils.capo_utils import (
 from promptolution.utils.prompt import Prompt
 
 from src.mo_capo import MoCAPO
+from src.budget_control import BudgetExhausted
 
 
 class NSGAiiPO(MoCAPO):
@@ -107,6 +108,33 @@ class NSGAiiPO(MoCAPO):
         """Execute one generation of NSGA-II: crossover, mutation, evaluation, and environmental selection."""
         # Generate offspring through the overridable variation operator.
         new_challengers = self._generate_challengers()
+
+        # Full-development NSGA-II may reduce offspring count near the hard
+        # budget, but every retained offspring receives one complete evaluation.
+        controller = getattr(self, "budget_controller", None)
+        if (
+            controller is not None
+            and hasattr(self.task, "_resolve_positions")
+            and hasattr(self.task, "pred_cache")
+        ):
+            new_challengers = controller.fit_fairness_prompts(
+                task=self.task,
+                prompts=new_challengers,
+                eval_strategy="full",
+            )
+            if not new_challengers:
+                estimate = controller.estimated_next_operation_tokens or 0
+                controller.request_stop(
+                    reason="next_complete_candidate_exceeds_budget",
+                    operation="nsgaii_full_candidate",
+                    estimated_tokens=estimate,
+                )
+                raise BudgetExhausted(
+                    operation="nsgaii_full_candidate",
+                    estimated_tokens=estimate,
+                    remaining_tokens=controller.remaining_tokens,
+                    reason="next_complete_candidate_exceeds_budget",
+                )
 
         # Combine parent and offspring populations
         candidates = self.prompts + new_challengers

@@ -22,7 +22,7 @@ from src.fairness.objective_mutation import (
     generate_objective_aware_challengers,
 )
 
-TRI_FAIR_METHOD_VERSION = "2.0-statistical-objective-aware"
+TRI_FAIR_METHOD_VERSION = "2.1-strict-budget-statistical-objective-aware"
 
 
 class TriFair(ResumableOptimizerMixin, MoCAPO):

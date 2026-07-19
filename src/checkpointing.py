@@ -20,8 +20,10 @@ import numpy as np
 from promptolution.utils.callbacks import BaseCallback
 from promptolution.utils.prompt import Prompt
 
+from src.budget_control import BudgetExhausted
+
 logger = logging.getLogger(__name__)
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 
 def _load_torch(*, required: bool = False):
@@ -120,6 +122,11 @@ def capture_optimizer_state(optimizer: Any) -> Dict[str, Any]:
         "global_max_bounds": getattr(optimizer, "global_max_bounds", None),
         "aggregate_records": getattr(optimizer, "aggregate_records", None),
         "population_metrics": getattr(optimizer, "_population_metrics", None),
+        "budget_controller": (
+            optimizer.budget_controller.state_dict()
+            if getattr(optimizer, "budget_controller", None) is not None
+            else None
+        ),
         "task": {
             "pred_cache": getattr(task, "pred_cache", None),
             "sequence_cache": getattr(task, "sequence_cache", None),
@@ -149,9 +156,10 @@ def capture_optimizer_state(optimizer: Any) -> Dict[str, Any]:
 
 def restore_optimizer_state(optimizer: Any, state: Dict[str, Any]) -> None:
     version = int(state.get("version", -1))
-    if version not in {1, CHECKPOINT_VERSION}:
+    if version not in {1, 2, CHECKPOINT_VERSION}:
         raise ValueError(
-            f"Unsupported checkpoint version {state.get('version')}; expected 1 or {CHECKPOINT_VERSION}"
+            "Unsupported checkpoint version "
+            f"{state.get('version')}; expected one of 1, 2, {CHECKPOINT_VERSION}"
         )
     if state.get("optimizer_class") != optimizer.__class__.__name__:
         raise ValueError(
@@ -204,6 +212,15 @@ def restore_optimizer_state(optimizer: Any, state: Dict[str, Any]) -> None:
     _set_token_count(optimizer.predictor.llm, state["tokens"]["downstream"])
     if state["tokens"].get("meta") is not None and hasattr(optimizer, "meta_llm"):
         _set_token_count(optimizer.meta_llm, state["tokens"]["meta"])
+    controller_state = state.get("budget_controller")
+    controller = getattr(optimizer, "budget_controller", None)
+    if controller_state is not None:
+        if controller is None:
+            raise ValueError(
+                "Checkpoint contains strict-budget state, but the current run "
+                "did not create a budget controller"
+            )
+        controller.load_state_dict(controller_state)
 
     random.setstate(state["rng"]["python"])
     np.random.set_state(state["rng"]["numpy"])
@@ -261,11 +278,27 @@ class ResumableOptimizerMixin:
             self._pre_optimization_loop()
             self._completed_steps = 0
 
+        controller = getattr(self, "budget_controller", None)
         try:
             for _ in range(self._completed_steps, n_steps):
-                self.prompts = self._step()
+                original_crossovers = getattr(self, "crossovers_per_iter", None)
+                if controller is not None and original_crossovers is not None:
+                    self.crossovers_per_iter = controller.suggested_candidate_count(
+                        int(original_crossovers)
+                    )
+                try:
+                    self.prompts = self._step()
+                except BudgetExhausted as error:
+                    logger.info("Strict budget stop before model call: %s", error)
+                    break
+                finally:
+                    if original_crossovers is not None:
+                        self.crossovers_per_iter = original_crossovers
+
                 self._completed_steps += 1
                 if not self._on_step_end():
+                    break
+                if controller is not None and controller.stop_requested:
                     break
         except Exception:
             logger.exception("Resumable optimization step failed")

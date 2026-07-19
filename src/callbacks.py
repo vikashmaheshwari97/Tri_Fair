@@ -39,6 +39,8 @@ class ExperimentCallback(BaseCallback):
             if hasattr(optimizer, "meta_llm")
             else {}
         )
+        controller = getattr(optimizer, "budget_controller", None)
+        budget = controller.summary() if controller is not None else {}
 
         for prompt, score in zip(optimizer.prompts, optimizer.scores):
             blocks = _get_blocks(optimizer, prompt)
@@ -94,6 +96,18 @@ class ExperimentCallback(BaseCallback):
                     "input_tokens_meta": int(meta_counts.get("input_tokens", 0)),
                     "output_tokens_meta": int(meta_counts.get("output_tokens", 0)),
                     "total_tokens_meta": int(meta_counts.get("total_tokens", 0)),
+                    "requested_budget_downstream": budget.get(
+                        "requested_budget_tokens"
+                    ),
+                    "remaining_budget_downstream": budget.get("remaining_tokens"),
+                    "budget_utilization": budget.get("budget_utilization"),
+                    "strict_budget_enabled": budget.get(
+                        "strict_budget_enabled", False
+                    ),
+                    "near_budget_mode": bool(
+                        controller is not None and controller.near_budget_mode
+                    ),
+                    "budget_stopping_reason": budget.get("stopping_reason"),
                     "time": timestamp,
                     "step": self.step,
                 }

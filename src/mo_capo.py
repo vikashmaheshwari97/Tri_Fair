@@ -14,6 +14,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from promptolution.utils.config import ExperimentConfig
 
 from promptolution.optimizers.base_optimizer import BaseOptimizer
+
+from src.budget_control import BudgetExhausted
 from promptolution.tasks.multi_objective_task import MultiObjectiveTask
 from promptolution.utils.capo_utils import (
     build_few_shot_examples,
@@ -178,11 +180,20 @@ class MoCAPO(BaseOptimizer):
         # 1) generate challengers
         new_challengers = self._generate_challengers()
 
-        # 2) intensify each challenger; after each, advance incumbents + prune
+        # 2) intensify each challenger; after each, advance incumbents + prune.
+        # If the hard budget rejects a later challenger, preserve all complete
+        # challengers already processed in this final partial iteration.
+        completed_challengers = 0
         for challenger in new_challengers:
-            self._do_intensification(challenger)
-            self._select_survivors()
-            self._advance_one_incumbent()
+            try:
+                self._do_intensification(challenger)
+                completed_challengers += 1
+                self._select_survivors()
+                self._advance_one_incumbent()
+            except BudgetExhausted:
+                if completed_challengers == 0:
+                    raise
+                break
 
         self.prompts = self.incumbents + self.non_incumbents
         vecs = self._get_evaluated_vectors(self.prompts)

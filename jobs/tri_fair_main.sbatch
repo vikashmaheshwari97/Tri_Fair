@@ -43,11 +43,15 @@ MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 META_MAX_OUTPUT_TOKENS="${META_MAX_OUTPUT_TOKENS:-256}"
 N_INIT_PROMPTS="${N_INIT_PROMPTS:-12}"
-TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2}"
+TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2_3}"
 OBJECTIVE_AWARE_VARIATION="${OBJECTIVE_AWARE_VARIATION:-1}"
 FIXED_COST_UPPER_BOUND="${FIXED_COST_UPPER_BOUND:-}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 FORCE_FRESH="${FORCE_FRESH:-0}"
+STRICT_TOKEN_BUDGET="${STRICT_TOKEN_BUDGET:-1}"
+NEAR_BUDGET_FRACTION="${NEAR_BUDGET_FRACTION:-0.90}"
+MIN_BUDGET_UTILIZATION="${MIN_BUDGET_UTILIZATION:-0.95}"
+OUTPUT_TOKEN_RESERVE="${OUTPUT_TOKEN_RESERVE:-2}"
 
 case "$RUN_MODE" in
   auto|fresh|resume) ;;
@@ -167,7 +171,7 @@ else
   fi
 fi
 
-declare -a PYTHON_CMD objective_variation_args fixed_bound_args
+declare -a PYTHON_CMD objective_variation_args fixed_bound_args strict_budget_args
 tf_python_command PYTHON_CMD
 objective_variation_args=()
 if ! tf_is_true "$OBJECTIVE_AWARE_VARIATION"; then
@@ -177,6 +181,10 @@ fixed_bound_args=()
 if [[ -n "$FIXED_COST_UPPER_BOUND" ]]; then
   fixed_bound_args=(--fixed-cost-upper-bound "$FIXED_COST_UPPER_BOUND")
 fi
+strict_budget_args=(--strict-token-budget)
+if ! tf_is_true "$STRICT_TOKEN_BUDGET"; then
+  strict_budget_args=(--no-strict-token-budget)
+fi
 
 tf_log "============================================================"
 tf_log "Tri-Fair optimization task"
@@ -184,6 +192,7 @@ tf_log "job=${SLURM_JOB_ID:-local} array_task=$task_id/$total"
 tf_log "model=$model dataset=$dataset optimizer=$optimizer seed=$seed"
 tf_log "budget=$BUDGET checkpoints=$checkpoints mode=$resolved_mode"
 tf_log "namespace=$TF_RESULTS_NAMESPACE population=$N_INIT_PROMPTS objective_aware=$OBJECTIVE_AWARE_VARIATION"
+tf_log "strict_budget=$STRICT_TOKEN_BUDGET near_fraction=$NEAR_BUDGET_FRACTION min_utilization=$MIN_BUDGET_UTILIZATION output_reserve=$OUTPUT_TOKEN_RESERVE"
 tf_log "output_dir=$output_dir"
 tf_log "============================================================"
 
@@ -201,6 +210,10 @@ tf_log "============================================================"
   --meta-max-output-tokens "$META_MAX_OUTPUT_TOKENS" \
   --manifest-dir "$MANIFEST_DIR" \
   --max-steps "$MAX_STEPS" \
+  --near-budget-fraction "$NEAR_BUDGET_FRACTION" \
+  --minimum-budget-utilization "$MIN_BUDGET_UTILIZATION" \
+  --output-token-reserve "$OUTPUT_TOKEN_RESERVE" \
+  "${strict_budget_args[@]}" \
   "${objective_variation_args[@]}" \
   "${fixed_bound_args[@]}" \
   "${resume_args[@]}"

@@ -43,8 +43,8 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 source jobs/lib/common.sh
 
 tf_validate_positive_int BUDGET "$budget"
-MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2}"
-TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2}"
+MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2_2}"
+TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2_3}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 EVAL_INCUMBENTS="${EVAL_INCUMBENTS:-true}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
@@ -60,18 +60,25 @@ step_results="$logging_dir/step_results.parquet"
 declare -a PYTHON_CMD
 tf_python_command PYTHON_CMD
 
-# Checkpoint callbacks run after an optimizer step. The faithful budget mapping
-# is therefore the first recorded step whose cumulative downstream tokens are
-# at or above the requested checkpoint.
+# Legacy runs select the first step at or above the requested checkpoint.
+# Strict-budget runs may stop just below the threshold because the next complete
+# candidate cannot fit.  In that case, validate the run summary and select the
+# final fully logged population.
 read -r chosen_step actual_tokens < <(
-  "${PYTHON_CMD[@]}" - "$step_results" "$budget" <<'PY'
+  "${PYTHON_CMD[@]}" - "$step_results" "$logging_dir/run_summary.json" "$budget" <<'PY'
 from pathlib import Path
+import json
 import sys
 import pandas as pd
 
-path = Path(sys.argv[1])
-target = int(sys.argv[2])
-df = pd.read_parquet(path, columns=["step", "total_tokens_downstream"])
+step_path = Path(sys.argv[1])
+summary_path = Path(sys.argv[2])
+target = int(sys.argv[3])
+
+df = pd.read_parquet(
+    step_path,
+    columns=["step", "total_tokens_downstream"],
+)
 table = (
     df.assign(
         step=pd.to_numeric(df["step"], errors="raise").astype(int),
@@ -83,15 +90,46 @@ table = (
     .max()
     .sort_index()
 )
+if table.empty:
+    raise SystemExit("step_results.parquet contains no logged optimizer steps")
+
 reached = table[table >= target]
-if reached.empty:
-    maximum = int(table.max()) if len(table) else 0
+if not reached.empty:
+    print(int(reached.index[0]), int(reached.iloc[0]))
+    raise SystemExit(0)
+
+if not summary_path.is_file():
     raise SystemExit(
-        f"target budget {target} was not reached; maximum logged tokens={maximum}"
+        f"target budget {target} was not reached and run_summary.json is missing"
     )
-step = int(reached.index[0])
-actual = int(reached.iloc[0])
-print(step, actual)
+with summary_path.open("r", encoding="utf-8") as handle:
+    summary = json.load(handle)
+
+budget = summary.get("budget_controller") or {}
+strict = bool(budget.get("strict_budget_enabled", False))
+reason = str(budget.get("stopping_reason") or "")
+final_total = int(
+    (summary.get("final_downstream_tokens") or {}).get(
+        "total_tokens",
+        0,
+    )
+)
+accepted_reasons = {
+    "next_atomic_operation_exceeds_budget",
+    "next_complete_candidate_exceeds_budget",
+}
+if (
+    not strict
+    or reason not in accepted_reasons
+    or final_total > target
+):
+    raise SystemExit(
+        "target budget was not reached by a valid strict-budget stop: "
+        f"strict={strict}, reason={reason!r}, final_total={final_total}, "
+        f"target={target}"
+    )
+
+print(int(table.index[-1]), int(table.iloc[-1]))
 PY
 )
 

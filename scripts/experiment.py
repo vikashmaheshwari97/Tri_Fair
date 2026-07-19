@@ -44,6 +44,11 @@ from promptolution.utils.templates import EVOPROMPT_GA_TEMPLATE
 from src.mo_capo import MoCAPO
 from src.nsgaii_po import NSGAiiPO
 from src.callbacks import ExperimentCallback
+from src.budget_control import (
+    BudgetAwarePredictor,
+    BudgetStopCallback,
+    TokenBudgetController,
+)
 from src.checkpointing import OptimizerCheckpointCallback
 from src.config.dataset_configs import ALL_DATASETS
 from src.config.model_configs import ALL_MODELS
@@ -128,6 +133,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-objective-aware-variation", action="store_true")
 
     parser.add_argument(
+        "--strict-token-budget",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject downstream calls before they can cross the configured budget.",
+    )
+    parser.add_argument(
+        "--near-budget-fraction",
+        type=float,
+        default=0.90,
+        help="Begin reducing challenger count after this budget fraction.",
+    )
+    parser.add_argument(
+        "--minimum-budget-utilization",
+        type=float,
+        default=0.95,
+        help="Minimum accepted utilization for an atomic under-budget stop.",
+    )
+    parser.add_argument(
+        "--output-token-reserve",
+        type=int,
+        default=2,
+        help="Tokenizer margin reserved per downstream response.",
+    )
+
+    parser.add_argument(
         "--allow-under-budget-exit",
         action="store_true",
         help="Permit a run to exit below the requested token budget (debug only).",
@@ -155,6 +185,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Cost multipliers cannot be negative")
     if args.fixed_cost_upper_bound is not None and args.fixed_cost_upper_bound <= 0:
         raise ValueError("--fixed-cost-upper-bound must be positive")
+    if not 0.0 < args.near_budget_fraction < 1.0:
+        raise ValueError("--near-budget-fraction must lie strictly between 0 and 1")
+    if not 0.0 < args.minimum_budget_utilization <= 1.0:
+        raise ValueError("--minimum-budget-utilization must lie in (0, 1]")
+    if args.output_token_reserve < 0:
+        raise ValueError("--output-token-reserve cannot be negative")
 
 
 def _resolve_logging_dir(args: argparse.Namespace) -> Path:
@@ -201,6 +237,10 @@ def _validate_resume_metadata(logging_dir: Path, args: argparse.Namespace) -> No
             "max_few_shot_examples",
             "fixed_cost_upper_bound",
             "disable_objective_aware_variation",
+            "strict_token_budget",
+            "near_budget_fraction",
+            "minimum_budget_utilization",
+            "output_token_reserve",
         ),
     )
 
@@ -399,16 +439,30 @@ def run(args: argparse.Namespace, *, logging_dir: Path | None = None) -> Path:
         list(dataset_config.initial_prompts),
         args.n_init_prompts,
     )
-    predictor = MarkerBasedPredictor(downstream_llm, dev_task.classes)
+    base_predictor = MarkerBasedPredictor(downstream_llm, dev_task.classes)
+    budget_controller = None
+    if args.strict_token_budget:
+        budget_controller = TokenBudgetController(
+            llm=downstream_llm,
+            max_tokens=args.budget_per_run,
+            max_output_tokens=args.max_output_tokens,
+            near_budget_fraction=args.near_budget_fraction,
+            output_token_reserve=args.output_token_reserve,
+            event_log_path=logging_dir / "budget_events.jsonl",
+        )
+        predictor = BudgetAwarePredictor(base_predictor, budget_controller)
+    else:
+        predictor = base_predictor
 
     callbacks = [
         LoggerCallback(LOGGER),
         ExperimentCallback(dir=str(logging_dir)),
         OptimizerCheckpointCallback(logging_dir, checkpoints),
-        # This is intentionally last: logs and checkpoints are written for the
-        # budget-crossing step before the optimizer loop is stopped.
-        TokenCountCallback(args.budget_per_run, "total_tokens"),
     ]
+    if budget_controller is not None:
+        callbacks.append(BudgetStopCallback(budget_controller))
+    else:
+        callbacks.append(TokenCountCallback(args.budget_per_run, "total_tokens"))
 
     optimizer = _build_optimizer(
         args=args,
@@ -421,6 +475,8 @@ def run(args: argparse.Namespace, *, logging_dir: Path | None = None) -> Path:
         df_fewshots=df_fewshots,
         callbacks=callbacks,
     )
+    if budget_controller is not None:
+        optimizer.budget_controller = budget_controller
 
     if args.resume_from:
         if not hasattr(optimizer, "load_checkpoint"):
@@ -453,16 +509,58 @@ def run(args: argparse.Namespace, *, logging_dir: Path | None = None) -> Path:
 
     final_downstream = token_counts(downstream_llm)
     final_meta = token_counts(meta_llm)
+    final_total = int(final_downstream["total_tokens"])
+    if args.strict_token_budget and final_total > args.budget_per_run:
+        raise RuntimeError(
+            "Strict downstream-token budget violation: "
+            f"actual={final_total}, target={args.budget_per_run}"
+        )
+
+    utilization = final_total / args.budget_per_run
+    atomic_budget_stop = bool(
+        budget_controller is not None
+        and budget_controller.stopping_reason in {
+            "next_atomic_operation_exceeds_budget",
+            "next_complete_candidate_exceeds_budget",
+        }
+    )
+    accepted_atomic_stop = bool(
+        atomic_budget_stop
+        and utilization >= args.minimum_budget_utilization
+    )
     if (
-        final_downstream["total_tokens"] < args.budget_per_run
+        final_total < args.budget_per_run
         and not args.allow_under_budget_exit
+        and not accepted_atomic_stop
     ):
+        reason = (
+            budget_controller.stopping_reason
+            if budget_controller is not None
+            else None
+        )
         raise RuntimeError(
             "Optimizer exited below the requested evaluation-token budget: "
-            f"actual={final_downstream['total_tokens']}, target={args.budget_per_run}. "
-            "This often indicates an internal optimizer exception or an insufficient "
-            "--max-steps value."
+            f"actual={final_total}, target={args.budget_per_run}, "
+            f"utilization={utilization:.6f}, stopping_reason={reason!r}. "
+            "A clean strict-budget stop is accepted only when no complete atomic "
+            "operation fits and the minimum utilization threshold is met."
         )
+
+    budget_summary = (
+        budget_controller.summary()
+        if budget_controller is not None
+        else {
+            "strict_budget_enabled": False,
+            "requested_budget_tokens": args.budget_per_run,
+            "actual_downstream_tokens": final_total,
+            "remaining_tokens": max(0, args.budget_per_run - final_total),
+            "budget_difference_tokens": final_total - args.budget_per_run,
+            "budget_utilization": utilization,
+            "stopping_reason": "legacy_post_step_callback",
+        }
+    )
+    if budget_controller is not None:
+        budget_controller.write_summary(logging_dir / "budget_summary.json")
 
     summary = {
         "status": "complete",
@@ -480,6 +578,11 @@ def run(args: argparse.Namespace, *, logging_dir: Path | None = None) -> Path:
         "budget_overshoot_tokens": max(
             0, final_downstream["total_tokens"] - args.budget_per_run
         ),
+        "budget_difference_tokens": (
+            final_downstream["total_tokens"] - args.budget_per_run
+        ),
+        "budget_utilization": utilization,
+        "budget_controller": budget_summary,
         "manifest_path": getattr(dev_task, "manifest_path", None),
         "logging_dir": str(logging_dir),
         "checkpoint_latest": str(logging_dir / "checkpoints" / "latest.pkl"),
