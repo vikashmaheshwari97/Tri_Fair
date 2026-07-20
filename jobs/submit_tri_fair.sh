@@ -43,12 +43,19 @@ tf_validate_positive_int BUDGET "$BUDGET"
 tf_validate_positive_int MAX_CONCURRENT "$MAX_CONCURRENT"
 tf_validate_positive_int N_INIT_PROMPTS "$N_INIT_PROMPTS"
 tf_validate_positive_int MAX_STEPS "$MAX_STEPS"
+tf_validate_positive_int MAX_OUTPUT_TOKENS "$MAX_OUTPUT_TOKENS"
 
 declare -a models datasets optimizers seeds
 tf_split_csv "$TF_MODELS" models
 tf_split_csv "$TF_DATASETS" datasets
 tf_split_csv "$TF_OPTIMIZERS" optimizers
 tf_split_csv "$TF_SEEDS" seeds
+
+for model in "${models[@]}"; do
+  if [[ "$model" == "gpt-oss-120b" ]] && ((MAX_OUTPUT_TOKENS < 96)); then
+    tf_die "GPT-OSS-120B requires MAX_OUTPUT_TOKENS>=96; got $MAX_OUTPUT_TOKENS"
+  fi
+done
 
 total=$((${#models[@]} * ${#datasets[@]} * ${#optimizers[@]} * ${#seeds[@]}))
 ((total > 0)) || tf_die "Computed zero array tasks"
