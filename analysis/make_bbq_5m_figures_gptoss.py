@@ -1245,13 +1245,61 @@ def save_figure(fig: plt.Figure, outdir: Path, stem: str) -> None:
     plt.close(fig)
 
 
-def plot_stepwise_nr2_proxy(
+def plot_nr2_development_and_holdout(
     step_proxy: pd.DataFrame,
+    final_metrics: pd.DataFrame,
     outdir: Path,
     *,
     max_budget: int,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 4.0), constrained_layout=True)
+    """Show development-side anytime nR2 beside the exact 5M holdout result.
+
+    Panel A is computed from development objectives at every logged optimizer
+    step. Panel B uses only the exact 5M holdout metric from the three completed
+    independent seeds and connects those seed-wise values with method lines.
+    The two panels must not be interpreted as one continuous holdout trajectory.
+    """
+
+    require_columns(
+        final_metrics,
+        ["optimizer", "seed", "budget_checkpoint", "noisy_r2_3d"],
+        "5M run metrics",
+    )
+
+    exact = final_metrics[
+        pd.to_numeric(final_metrics["budget_checkpoint"], errors="coerce")
+        == FINAL_BUDGET
+    ].copy()
+    if exact.empty:
+        raise RuntimeError("No exact 5M holdout nR2 rows were found")
+
+    expected_pairs = {
+        (optimizer, seed)
+        for optimizer in OPTIMIZER_ORDER
+        for seed in EXPECTED_SEEDS
+    }
+    observed_pairs = {
+        (str(row.optimizer), int(row.seed))
+        for row in exact[["optimizer", "seed"]].dropna().itertuples(index=False)
+    }
+    if observed_pairs != expected_pairs:
+        missing = sorted(expected_pairs - observed_pairs)
+        extra = sorted(observed_pairs - expected_pairs)
+        raise RuntimeError(
+            "Exact 5M holdout nR2 requires the complete six-run grid; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(11.2, 4.25),
+        constrained_layout=True,
+        gridspec_kw={"width_ratios": [1.55, 1.0]},
+    )
+
+    # Panel A: development-side anytime proxy.
+    ax = axes[0]
     stats = step_band_statistics(
         step_proxy,
         "dev_noisy_r2_proxy",
@@ -1274,25 +1322,107 @@ def plot_stepwise_nr2_proxy(
             label=DISPLAY_NAME[optimizer],
         )
         ax.fill_between(
-            x, lower, upper, step="post", color=COLORS[optimizer], alpha=0.16
+            x,
+            lower,
+            upper,
+            step="post",
+            color=COLORS[optimizer],
+            alpha=0.16,
         )
-    ax.set_title("BBQ — GPT-OSS-120B")
+    ax.set_title("(a) Development Anytime nR2 Proxy ↓")
     ax.set_xlabel("Cumulative Downstream Tokens [×10⁶]")
-    ax.set_ylabel("Development nR2 Proxy ↓")
+    ax.set_ylabel("Development nR2 Proxy")
     ax.set_xlim(left=0.0, right=max_budget / 1_000_000.0)
     ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False)
-    ax.text(
-        0.02,
-        0.02,
-        "Development-only proxy; exact holdout nR2 is available at 5M only.",
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=7,
-        alpha=0.75,
+    ax.legend(frameon=False, loc="best")
+
+    # Panel B: exact untouched holdout evaluation, shown seed-by-seed.
+    # This keeps the same line/marker/band visual grammar as Panel A without
+    # falsely implying that exact holdout evaluation was performed at every
+    # intermediate token budget.
+    ax = axes[1]
+    seed_axis = np.asarray(EXPECTED_SEEDS, dtype=int)
+    all_values: list[float] = []
+
+    for optimizer in OPTIMIZER_ORDER:
+        group = exact[exact["optimizer"] == optimizer].copy()
+        group["seed"] = pd.to_numeric(group["seed"], errors="raise").astype(int)
+        group = group.sort_values("seed")
+
+        observed_seeds = group["seed"].to_numpy(dtype=int)
+        values = pd.to_numeric(group["noisy_r2_3d"], errors="raise").to_numpy(
+            dtype=float
+        )
+        if not np.array_equal(observed_seeds, seed_axis):
+            raise RuntimeError(
+                f"Expected exact nR2 seeds {seed_axis.tolist()} for {optimizer}, "
+                f"found {observed_seeds.tolist()}"
+            )
+        if not np.all(np.isfinite(values)):
+            raise RuntimeError(
+                f"Non-finite exact 5M holdout nR2 values for {optimizer}: "
+                f"{values.tolist()}"
+            )
+
+        mean = float(values.mean())
+        std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        all_values.extend(values.tolist())
+
+        ax.plot(
+            seed_axis,
+            values,
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            linewidth=2,
+            markersize=6,
+            label=f"{DISPLAY_NAME[optimizer]} ({mean:.4f} ± {std:.4f})",
+            zorder=3,
+        )
+
+        # A light horizontal band summarizes the three-seed mean ± SD while the
+        # connected markers retain the individual exact holdout results.
+        ax.fill_between(
+            [seed_axis.min(), seed_axis.max()],
+            [mean - std, mean - std],
+            [mean + std, mean + std],
+            color=COLORS[optimizer],
+            alpha=0.12,
+            zorder=1,
+        )
+        ax.hlines(
+            mean,
+            seed_axis.min(),
+            seed_axis.max(),
+            color=COLORS[optimizer],
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.75,
+            zorder=2,
+        )
+
+    ax.set_title("(b) Exact 5M Holdout nR2 by Seed ↓")
+    ax.set_xlabel("Random Seed")
+    ax.set_ylabel("Exact 5M Holdout nR2")
+    ax.set_xticks(seed_axis, [str(seed) for seed in seed_axis])
+    ax.set_xlim(seed_axis.min() - 0.35, seed_axis.max() + 0.35)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="best", fontsize=8.2)
+
+    if all_values:
+        minimum = min(all_values)
+        maximum = max(all_values)
+        padding = max(0.004, 0.18 * max(maximum - minimum, 1e-6))
+        ax.set_ylim(minimum - padding, maximum + padding)
+
+    fig.suptitle(
+        "BBQ — GPT-OSS-120B: Development Dynamics and Final Holdout",
+        fontsize=12,
     )
-    save_figure(fig, outdir, "bbq_gptoss120b_5m_final_stepwise_dev_nr2_proxy")
+    save_figure(
+        fig,
+        outdir,
+        "bbq_gptoss120b_5m_final_nr2_development_and_holdout",
+    )
 
 
 def plot_stepwise_coverage_validity(
@@ -2112,12 +2242,12 @@ It is not a dollar amount and is not the Rocket GPU bill.
 - `noisy_r2_3d`: exact checkpoint-level holdout nR2, lower is better.
 - `hv_test_optimistic_3d` / `hv_test_pessimistic_3d`: exact test hypervolume, higher is better.
 - `approximation_gap_3d`: exact approximation gap, lower is better.
-- `bbq_gptoss120b_5m_final_stepwise_dev_nr2_proxy.*`: development-only anytime proxy, not exact holdout nR2.
+- `bbq_gptoss120b_5m_final_nr2_development_and_holdout.*`: Panel A is the development-only anytime proxy; Panel B shows the exact 5M holdout nR2 for seeds 42, 43, and 44 with method mean ± SD in the legend.
 - Coverage-invalid rows are excluded from main publication figures and retained in `all_evaluations_raw.parquet` and the coverage diagnostic figure.
 
 ## Main figure files
 
-- `bbq_gptoss120b_5m_final_stepwise_dev_nr2_proxy.*`
+- `bbq_gptoss120b_5m_final_nr2_development_and_holdout.*`
 - `bbq_gptoss120b_5m_final_stepwise_coverage_validity.*`
 - `bbq_gptoss120b_5m_final_stepwise_hv_exact_gap.*`
 - `bbq_gptoss120b_5m_final_exact_nr2_hv_gap.*`
@@ -2249,8 +2379,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         figure_dir / "bbq_gptoss120b_5m_final_stepwise_dev_nr2_proxy.csv", index=False
     )
 
-    plot_stepwise_nr2_proxy(
+    plot_nr2_development_and_holdout(
         step_proxy,
+        final_metrics,
         figure_dir,
         max_budget=max_plot_budget,
     )
