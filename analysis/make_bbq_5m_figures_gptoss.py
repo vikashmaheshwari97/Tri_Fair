@@ -1252,12 +1252,13 @@ def plot_nr2_development_and_holdout(
     *,
     max_budget: int,
 ) -> None:
-    """Show development-side anytime nR2 beside the exact 5M holdout result.
+    """Show development dynamics beside the exact final holdout comparison.
 
-    Panel A is computed from development objectives at every logged optimizer
-    step. Panel B uses only the exact 5M holdout metric from the three completed
-    independent seeds and connects those seed-wise values with method lines.
-    The two panels must not be interpreted as one continuous holdout trajectory.
+    Panel A summarizes the current development Pareto front at every logged
+    optimizer step. Panel B shows the three independent exact 5M holdout nR2
+    values for each method as a categorical dot-and-error plot. Seeds are
+    labelled individually but are not connected, because seed number is not a
+    temporal or ordered axis.
     """
 
     require_columns(
@@ -1293,7 +1294,7 @@ def plot_nr2_development_and_holdout(
     fig, axes = plt.subplots(
         1,
         2,
-        figsize=(11.2, 4.25),
+        figsize=(11.4, 4.35),
         constrained_layout=True,
         gridspec_kw={"width_ratios": [1.55, 1.0]},
     )
@@ -1329,6 +1330,7 @@ def plot_nr2_development_and_holdout(
             color=COLORS[optimizer],
             alpha=0.16,
         )
+
     ax.set_title("(a) Development Anytime nR2 Proxy ↓")
     ax.set_xlabel("Cumulative Downstream Tokens [×10⁶]")
     ax.set_ylabel("Development nR2 Proxy")
@@ -1336,26 +1338,32 @@ def plot_nr2_development_and_holdout(
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False, loc="best")
 
-    # Panel B: exact untouched holdout evaluation, shown seed-by-seed.
-    # This keeps the same line/marker/band visual grammar as Panel A without
-    # falsely implying that exact holdout evaluation was performed at every
-    # intermediate token budget.
+    # Panel B: exact untouched holdout result.
+    #
+    # Each small open marker is one independent 5M run. The large filled
+    # diamond is the three-seed mean and the vertical error bar is ±1 sample SD.
+    # We deliberately do not connect seeds because 42, 43 and 44 are categorical
+    # replicates rather than an ordered trajectory.
     ax = axes[1]
-    seed_axis = np.asarray(EXPECTED_SEEDS, dtype=int)
+    method_positions = np.arange(len(OPTIMIZER_ORDER), dtype=float)
+    seed_offsets = np.linspace(-0.13, 0.13, len(EXPECTED_SEEDS))
     all_values: list[float] = []
 
-    for optimizer in OPTIMIZER_ORDER:
+    for method_index, optimizer in enumerate(OPTIMIZER_ORDER):
         group = exact[exact["optimizer"] == optimizer].copy()
         group["seed"] = pd.to_numeric(group["seed"], errors="raise").astype(int)
         group = group.sort_values("seed")
 
         observed_seeds = group["seed"].to_numpy(dtype=int)
-        values = pd.to_numeric(group["noisy_r2_3d"], errors="raise").to_numpy(
-            dtype=float
-        )
-        if not np.array_equal(observed_seeds, seed_axis):
+        expected_seeds = np.asarray(EXPECTED_SEEDS, dtype=int)
+        values = pd.to_numeric(
+            group["noisy_r2_3d"],
+            errors="raise",
+        ).to_numpy(dtype=float)
+
+        if not np.array_equal(observed_seeds, expected_seeds):
             raise RuntimeError(
-                f"Expected exact nR2 seeds {seed_axis.tolist()} for {optimizer}, "
+                f"Expected exact nR2 seeds {expected_seeds.tolist()} for {optimizer}, "
                 f"found {observed_seeds.tolist()}"
             )
         if not np.all(np.isfinite(values)):
@@ -1368,51 +1376,85 @@ def plot_nr2_development_and_holdout(
         std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
         all_values.extend(values.tolist())
 
-        ax.plot(
-            seed_axis,
+        x_points = method_positions[method_index] + seed_offsets
+        ax.scatter(
+            x_points,
             values,
-            color=COLORS[optimizer],
+            s=52,
+            facecolors="white",
+            edgecolors=COLORS[optimizer],
             marker=MARKERS[optimizer],
-            linewidth=2,
-            markersize=6,
-            label=f"{DISPLAY_NAME[optimizer]} ({mean:.4f} ± {std:.4f})",
-            zorder=3,
+            linewidths=1.6,
+            zorder=4,
         )
 
-        # A light horizontal band summarizes the three-seed mean ± SD while the
-        # connected markers retain the individual exact holdout results.
-        ax.fill_between(
-            [seed_axis.min(), seed_axis.max()],
-            [mean - std, mean - std],
-            [mean + std, mean + std],
-            color=COLORS[optimizer],
-            alpha=0.12,
-            zorder=1,
-        )
-        ax.hlines(
+        for x_value, y_value, seed in zip(x_points, values, observed_seeds):
+            ax.annotate(
+                str(seed),
+                xy=(x_value, y_value),
+                xytext=(0, 7),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=7.5,
+                color=COLORS[optimizer],
+            )
+
+        ax.errorbar(
+            method_positions[method_index],
             mean,
-            seed_axis.min(),
-            seed_axis.max(),
+            yerr=std,
+            fmt="D",
+            markersize=7.5,
+            markerfacecolor=COLORS[optimizer],
+            markeredgecolor="white",
+            markeredgewidth=0.9,
             color=COLORS[optimizer],
-            linewidth=1.2,
-            linestyle="--",
-            alpha=0.75,
-            zorder=2,
+            ecolor=COLORS[optimizer],
+            elinewidth=2,
+            capsize=6,
+            capthick=1.6,
+            zorder=5,
         )
 
-    ax.set_title("(b) Exact 5M Holdout nR2 by Seed ↓")
-    ax.set_xlabel("Random Seed")
+        ax.annotate(
+            f"{mean:.4f} ± {std:.4f}",
+            xy=(method_positions[method_index], mean),
+            xytext=(0, -15),
+            textcoords="offset points",
+            ha="center",
+            va="top",
+            fontsize=8.5,
+            fontweight="semibold",
+            color=COLORS[optimizer],
+        )
+
+    ax.set_title("(b) Exact 5M Holdout nR2 ↓")
+    ax.set_xlabel("Method")
     ax.set_ylabel("Exact 5M Holdout nR2")
-    ax.set_xticks(seed_axis, [str(seed) for seed in seed_axis])
-    ax.set_xlim(seed_axis.min() - 0.35, seed_axis.max() + 0.35)
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="best", fontsize=8.2)
+    ax.set_xticks(
+        method_positions,
+        [DISPLAY_NAME[optimizer] for optimizer in OPTIMIZER_ORDER],
+    )
+    ax.set_xlim(-0.45, len(OPTIMIZER_ORDER) - 0.55)
+    ax.grid(True, axis="y", alpha=0.25)
 
     if all_values:
         minimum = min(all_values)
         maximum = max(all_values)
-        padding = max(0.004, 0.18 * max(maximum - minimum, 1e-6))
+        padding = max(0.005, 0.22 * max(maximum - minimum, 1e-6))
         ax.set_ylim(minimum - padding, maximum + padding)
+
+    ax.text(
+        0.02,
+        0.98,
+        "Open markers: individual seeds\nDiamond/error bar: mean ± SD",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7.6,
+        color="0.3",
+    )
 
     fig.suptitle(
         "BBQ — GPT-OSS-120B: Development Dynamics and Final Holdout",
