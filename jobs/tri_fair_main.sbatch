@@ -18,8 +18,8 @@
 
 set -Eeuo pipefail
 module purge
-module load python/3.11.14
-module load python-venv/1.0
+module --ignore_cache load python/3.11.14
+module --ignore_cache load python-venv/1.0
 
 source "$HOME/venvs/tri-fair/bin/activate"
 export TF_PYTHON="$HOME/venvs/tri-fair/bin/python"
