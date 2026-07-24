@@ -23,11 +23,10 @@ Key safeguards
    ``0.12 × mean input tokens + 0.49 × mean output tokens``. They are not
    Rocket GPU charges and are not dollar costs.
 7. The accuracy–cost and accuracy–unfairness figures are computed from the
-   candidate-level final-checkpoint ``eval.parquet`` rows.  They show all actual
-   evaluated candidates, per-seed Pareto-front trajectories, the pooled
-   two-objective Pareto envelope, and the across-seed empirical-attainment
-   summary.  No hand-entered per-seed extrema are substituted for the evaluated
-   candidates.
+   candidate-level final-checkpoint ``eval.parquet`` rows.  As in the BBQ
+   generator, each method is summarized by its across-seed median empirical
+   attainment curve and shaded seed range.  No hand-entered per-seed extrema
+   are substituted for the evaluated candidates.
 
 Default usage on Rocket::
 
@@ -1749,127 +1748,6 @@ def test_objective_matrix(frame: pd.DataFrame) -> np.ndarray:
     return np.column_stack([1.0 - quality, cost, fairness])
 
 
-def candidate_trajectory_table(final: pd.DataFrame) -> pd.DataFrame:
-    """Order and audit the final holdout candidates for trajectory plots.
-
-    ``eval.parquet`` stores the selected holdout candidates in evaluation
-    order and also records their originating optimizer ``time`` and ``step``.
-    The generic loader may concatenate runs in a different order, so this
-    helper reconstructs a stable sequence within each method/seed run.  It also
-    records the three-objective and two projected Pareto memberships used by
-    the two accuracy trade-off figures.
-    """
-
-    require_columns(
-        final,
-        [
-            "optimizer",
-            "seed",
-            "test_quality",
-            "test_cost",
-            "test_fairness",
-        ],
-        "final candidate evaluations",
-    )
-
-    ordered_groups: list[pd.DataFrame] = []
-    expected_pairs = {
-        (optimizer, seed)
-        for optimizer in OPTIMIZER_ORDER
-        for seed in EXPECTED_SEEDS
-    }
-    observed_pairs: set[tuple[str, int]] = set()
-
-    for (optimizer, seed), source_group in final.groupby(
-        ["optimizer", "seed"],
-        sort=True,
-        dropna=False,
-    ):
-        optimizer_name = str(optimizer)
-        seed_value = int(seed)
-        observed_pairs.add((optimizer_name, seed_value))
-
-        group = source_group.copy()
-        group["_source_row_order"] = np.arange(len(group), dtype=int)
-        sort_columns: list[str] = []
-
-        if "time" in group:
-            group["_trajectory_time"] = pd.to_numeric(
-                group["time"],
-                errors="coerce",
-            )
-            sort_columns.append("_trajectory_time")
-        if "step" in group:
-            group["_trajectory_step"] = pd.to_numeric(
-                group["step"],
-                errors="coerce",
-            )
-            sort_columns.append("_trajectory_step")
-        sort_columns.append("_source_row_order")
-
-        group = group.sort_values(
-            sort_columns,
-            kind="stable",
-            na_position="last",
-        ).reset_index(drop=True)
-        group["candidate_order"] = np.arange(1, len(group) + 1, dtype=int)
-
-        objective_3d = test_objective_matrix(group)
-        valid_3d = np.all(np.isfinite(objective_3d), axis=1)
-        group["pareto_3d"] = False
-        if np.any(valid_3d):
-            group.loc[valid_3d, "pareto_3d"] = pareto_mask_minimize(
-                objective_3d[valid_3d]
-            )
-
-        for x_col, flag_column in (
-            ("test_cost", "pareto_accuracy_cost_2d"),
-            ("test_fairness", "pareto_accuracy_unfairness_2d"),
-        ):
-            x = finite_numeric(group[x_col])
-            y = finite_numeric(group["test_quality"])
-            objective_2d = np.column_stack([x, 1.0 - y])
-            valid_2d = np.all(np.isfinite(objective_2d), axis=1)
-            group[flag_column] = False
-            if np.any(valid_2d):
-                group.loc[valid_2d, flag_column] = pareto_mask_minimize(
-                    objective_2d[valid_2d]
-                )
-
-        group = group.drop(
-            columns=[
-                "_source_row_order",
-                "_trajectory_time",
-                "_trajectory_step",
-            ],
-            errors="ignore",
-        )
-        ordered_groups.append(group)
-
-    if observed_pairs != expected_pairs:
-        missing = sorted(expected_pairs - observed_pairs)
-        extra = sorted(observed_pairs - expected_pairs)
-        raise RuntimeError(
-            "Candidate trajectories require the complete six-run grid; "
-            f"missing={missing}, extra={extra}"
-        )
-    if not ordered_groups:
-        raise RuntimeError("No final holdout candidates are available for trajectories")
-
-    trajectories = pd.concat(ordered_groups, ignore_index=True)
-    counts = trajectories.groupby(["optimizer", "seed"], sort=True).size()
-    if (counts < 2).any():
-        too_short = {
-            (str(optimizer), int(seed)): int(count)
-            for (optimizer, seed), count in counts[counts < 2].items()
-        }
-        raise RuntimeError(
-            "Each candidate trajectory requires at least two evaluated points; "
-            f"found={too_short}"
-        )
-    return trajectories
-
-
 def y_attained_at_x(data: pd.DataFrame, x_grid: np.ndarray, x_col: str) -> np.ndarray:
     x = finite_numeric(data[x_col])
     y = finite_numeric(data["test_quality"])
@@ -1892,19 +1770,8 @@ def plot_empirical_attainment(
     xlabel: str,
     filename: str,
 ) -> None:
-    """Plot observed candidate paths and the seed-level attainment summary."""
+    """Match the clean BBQ median-and-range empirical-attainment style."""
 
-    require_columns(
-        final,
-        [
-            "optimizer",
-            "seed",
-            "candidate_order",
-            "test_quality",
-            x_col,
-        ],
-        f"{x_col} candidate trajectories",
-    )
     xmin = float(np.nanmin(finite_numeric(final[x_col])))
     xmax = float(np.nanmax(finite_numeric(final[x_col])))
     padding = 0.03 * max(xmax - xmin, 1e-6)
@@ -1919,53 +1786,6 @@ def plot_empirical_attainment(
             seed_group = seed_group.loc[valid].reset_index(drop=True)
             if seed_group.empty:
                 continue
-
-            # Small translucent points expose all actual eval.parquet
-            # candidates. The thin path connects this seed's observed
-            # two-objective Pareto front; sorting by the horizontal objective
-            # keeps the trade-off trajectory readable instead of drawing a
-            # misleading zig-zag through dominated candidates.
-            sequence = seed_group.sort_values(
-                "candidate_order",
-                kind="stable",
-            )
-            ax.scatter(
-                finite_numeric(sequence[x_col]),
-                finite_numeric(sequence["test_quality"]),
-                color=COLORS[optimizer],
-                marker=MARKERS[optimizer],
-                s=18,
-                alpha=0.32,
-                linewidths=0.0,
-                zorder=3,
-            )
-
-            flag_column = (
-                "pareto_accuracy_cost_2d"
-                if x_col == "test_cost"
-                else "pareto_accuracy_unfairness_2d"
-            )
-            seed_front_2d = (
-                seed_group[seed_group[flag_column].fillna(False).astype(bool)]
-                .drop_duplicates(subset=[x_col, "test_quality"])
-                .sort_values(
-                    [x_col, "test_quality"],
-                    ascending=[True, True],
-                    kind="stable",
-                )
-            )
-            if not seed_front_2d.empty:
-                ax.plot(
-                    finite_numeric(seed_front_2d[x_col]),
-                    finite_numeric(seed_front_2d["test_quality"]),
-                    color=COLORS[optimizer],
-                    marker=MARKERS[optimizer],
-                    linewidth=0.9,
-                    markersize=3.2,
-                    alpha=0.36,
-                    zorder=3,
-                )
-
             front = seed_group.loc[pareto_mask_minimize(test_objective_matrix(seed_group))]
             curves.append(y_attained_at_x(front, x_grid, x_col))
         if not curves:
@@ -1991,41 +1811,7 @@ def plot_empirical_attainment(
         ax.fill_between(
             x_grid[valid], lower[valid], upper[valid], step="post", color=COLORS[optimizer], alpha=0.16
         )
-
-        # Overlay the observed pooled two-objective envelope. Unlike the
-        # median attainment step, every marker on this line is a real evaluated
-        # candidate from eval.parquet.
-        x = finite_numeric(optimizer_data[x_col])
-        y = finite_numeric(optimizer_data["test_quality"])
-        objective_2d = np.column_stack([x, 1.0 - y])
-        valid_2d = np.all(np.isfinite(objective_2d), axis=1)
-        if np.any(valid_2d):
-            pooled = optimizer_data.loc[valid_2d].copy()
-            pooled = pooled.loc[
-                pareto_mask_minimize(objective_2d[valid_2d])
-            ].sort_values(
-                [x_col, "test_quality"],
-                ascending=[True, True],
-                kind="stable",
-            )
-            ax.plot(
-                finite_numeric(pooled[x_col]),
-                finite_numeric(pooled["test_quality"]),
-                color=COLORS[optimizer],
-                marker=MARKERS[optimizer],
-                markerfacecolor=COLORS[optimizer],
-                markeredgecolor="white",
-                markeredgewidth=0.7,
-                linewidth=1.5,
-                markersize=5.5,
-                alpha=0.95,
-                zorder=5,
-            )
-
-    ax.set_title(
-        "Civil Comments — GPT-OSS-120B at 5M\n"
-        "Evaluated Candidates, Seed Fronts, and Empirical Attainment"
-    )
+    ax.set_title("Civil Comments — GPT-OSS-120B at 5M")
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Test Accuracy")
     ax.grid(True, alpha=0.25)
@@ -2109,6 +1895,135 @@ def plot_three_objective_pareto(final: pd.DataFrame, outdir: Path) -> None:
     ax.set_zlabel("Accuracy ↑")
     ax.legend(frameon=False)
     save_figure(fig, outdir, "civil_comments_gptoss120b_5m_final_test_pareto_3d")
+
+
+def per_seed_three_objective_fronts(final: pd.DataFrame) -> pd.DataFrame:
+    """Return the actual per-seed 3-objective Pareto candidates."""
+
+    fronts: list[pd.DataFrame] = []
+    for optimizer in OPTIMIZER_ORDER:
+        optimizer_data = final[final["optimizer"] == optimizer]
+        for seed, seed_group in optimizer_data.groupby("seed", sort=True):
+            matrix = test_objective_matrix(seed_group)
+            valid = np.all(np.isfinite(matrix), axis=1)
+            seed_group = seed_group.loc[valid].reset_index(drop=True)
+            matrix = matrix[valid]
+            if seed_group.empty:
+                continue
+            front = seed_group.loc[pareto_mask_minimize(matrix)].copy()
+            front["pareto_seed"] = int(seed)
+            fronts.append(front)
+    if not fronts:
+        raise RuntimeError("No Civil Comments test Pareto candidates are available")
+    return pd.concat(fronts, ignore_index=True)
+
+
+def plot_three_objective_pareto_improved(
+    final: pd.DataFrame,
+    outdir: Path,
+) -> None:
+    """Create the BBQ-style 3D Pareto view with two exact projections."""
+
+    fronts = per_seed_three_objective_fronts(final)
+    fig = plt.figure(figsize=(14.0, 8.5))
+    grid = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=(1.48, 1.0),
+        left=0.055,
+        right=0.985,
+        bottom=0.09,
+        top=0.90,
+        wspace=0.25,
+        hspace=0.34,
+    )
+    ax_3d = fig.add_subplot(grid[:, 0], projection="3d")
+    ax_cost = fig.add_subplot(grid[0, 1])
+    ax_fairness = fig.add_subplot(grid[1, 1])
+
+    legend_handles: list[object] = []
+    for optimizer in OPTIMIZER_ORDER:
+        method = fronts[fronts["optimizer"] == optimizer]
+        if method.empty:
+            continue
+        scatter_kwargs = {
+            "color": COLORS[optimizer],
+            "marker": MARKERS[optimizer],
+            "s": 42,
+            "alpha": 0.72,
+            "edgecolors": "white",
+            "linewidths": 0.45,
+        }
+        handle = ax_3d.scatter(
+            method["test_cost"],
+            method["test_fairness"],
+            method["test_quality"],
+            label=DISPLAY_NAME[optimizer],
+            **scatter_kwargs,
+        )
+        legend_handles.append(handle)
+        ax_cost.scatter(
+            method["test_cost"],
+            method["test_quality"],
+            **scatter_kwargs,
+        )
+        ax_fairness.scatter(
+            method["test_fairness"],
+            method["test_quality"],
+            **scatter_kwargs,
+        )
+
+    ax_3d.set_xlabel(COST_AXIS_LABEL, labelpad=12)
+    ax_3d.set_ylabel(UNFAIRNESS_AXIS_LABEL, labelpad=14)
+    ax_3d.set_zlabel("Test Accuracy ↑", labelpad=10)
+    ax_3d.view_init(elev=24, azim=-60)
+    ax_3d.grid(True, alpha=0.28)
+
+    ax_cost.set_title("Accuracy–Cost Projection")
+    ax_cost.set_xlabel(COST_AXIS_LABEL)
+    ax_cost.set_ylabel("Test Accuracy ↑")
+    ax_cost.grid(True, alpha=0.25)
+
+    ax_fairness.set_title("Accuracy–Unfairness Projection")
+    ax_fairness.set_xlabel(UNFAIRNESS_AXIS_LABEL)
+    ax_fairness.set_ylabel("Test Accuracy ↑")
+    ax_fairness.grid(True, alpha=0.25)
+
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            labels=[
+                DISPLAY_NAME[optimizer]
+                for optimizer in OPTIMIZER_ORDER
+                if not fronts[fronts["optimizer"] == optimizer].empty
+            ],
+            loc="upper left",
+            bbox_to_anchor=(0.055, 0.89),
+            frameon=False,
+        )
+
+    fig.suptitle(
+        "Civil Comments — GPT-OSS-120B at 5M: Test Pareto Fronts",
+        fontsize=15,
+        y=0.975,
+    )
+    fig.text(
+        0.055,
+        0.025,
+        (
+            "Points are per-seed 3-objective Pareto candidates; lower "
+            "cost/unfairness and higher accuracy are preferred."
+        ),
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#333333",
+    )
+    save_figure(
+        fig,
+        outdir,
+        "civil_comments_gptoss120b_5m_final_test_pareto_3d_improved",
+    )
 
 
 def plot_method_comparison_bars(final_metrics: pd.DataFrame, outdir: Path) -> None:
@@ -2603,14 +2518,10 @@ It is not a dollar amount and is not the Rocket GPU bill.
 
 The accuracy–cost and accuracy–unfairness figures are empirical attainment
 curves computed from the final-checkpoint, fairness-ready candidate rows loaded
-from each run's `eval.parquet`.  Translucent points expose every actual
-candidate. Thin paths connect each seed's observed two-objective Pareto front,
-and the outlined method path connects the pooled observed two-objective Pareto
-envelope. The thick step curve remains the median seed-level attainment curve,
-with the across-seed range as a shaded band.
-
-The exact plotted rows and their reconstructed order are exported to
-`civil_comments_gptoss120b_5m_final_candidate_trajectories.csv`.
+from each run's `eval.parquet`. As in the BBQ figures, the thick step curve is
+the median seed-level attainment curve and the translucent shaded band is the
+full across-seed range. Candidate clouds and extra front overlays are omitted
+to keep the comparison readable.
 
 ## Main figure files
 
@@ -2623,6 +2534,7 @@ The exact plotted rows and their reconstructed order are exported to
 - `civil_comments_gptoss120b_5m_final_attainment_accuracy_unfairness.*`
 - `civil_comments_gptoss120b_5m_final_pareto_cost_unfairness.*`
 - `civil_comments_gptoss120b_5m_final_test_pareto_3d.*`
+- `civil_comments_gptoss120b_5m_final_test_pareto_3d_improved.*`
 - `civil_comments_gptoss120b_5m_final_method_comparison_hv_nr2_gap.*`
 - `civil_comments_gptoss120b_5m_final_fairness_readiness_diagnostics.*`
 - `civil_comments_gptoss120b_5m_final_high_accuracy_operating_points.*`
@@ -2688,7 +2600,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     selected = selected_final_runs(run_metrics)
     final_evaluations = final_checkpoint_evaluations(evaluations, selected)
     final_raw_evaluations = final_checkpoint_evaluations(raw_evaluations, selected)
-    candidate_trajectories = candidate_trajectory_table(final_evaluations)
     checkpoint_metrics = complete_checkpoint_metrics(
         checkpoint_run_metrics(run_metrics)
     )
@@ -2735,6 +2646,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "civil_comments_gptoss120b_5m_final_approved_extrema_by_seed.csv",
         "civil_comments_gptoss120b_5m_final_approved_extrema_aggregate.csv",
         "civil_comments_gptoss120b_5m_final_approved_extrema_aggregate.md",
+        "civil_comments_gptoss120b_5m_final_candidate_trajectories.csv",
     ):
         (figure_dir / obsolete_name).unlink(missing_ok=True)
 
@@ -2750,34 +2662,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     final_raw_evaluations.to_parquet(
         figure_dir / "civil_comments_gptoss120b_5m_final_raw_final_evaluations.parquet",
-        index=False,
-    )
-    trajectory_audit_columns = [
-        column
-        for column in (
-            "optimizer",
-            "seed",
-            "candidate_order",
-            "step",
-            "time",
-            "prompt_id",
-            "is_incumbent",
-            "selection_policy",
-            "test_quality",
-            "test_cost",
-            "test_fairness",
-            "test_fairness_ready",
-            "pareto_3d",
-            "pareto_accuracy_cost_2d",
-            "pareto_accuracy_unfairness_2d",
-            "run_key",
-            "run_dir",
-        )
-        if column in candidate_trajectories
-    ]
-    candidate_trajectories[trajectory_audit_columns].to_csv(
-        figure_dir
-        / "civil_comments_gptoss120b_5m_final_candidate_trajectories.csv",
         index=False,
     )
     step_proxy.to_csv(
@@ -2804,14 +2688,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     plot_exact_checkpoint_mo_metrics(checkpoint_metrics, figure_dir)
     plot_balanced_budget_trajectory(checkpoint_metrics, figure_dir)
     plot_empirical_attainment(
-        candidate_trajectories,
+        final_evaluations,
         figure_dir,
         x_col="test_cost",
         xlabel=COST_AXIS_LABEL,
         filename="civil_comments_gptoss120b_5m_final_attainment_accuracy_cost",
     )
     plot_empirical_attainment(
-        candidate_trajectories,
+        final_evaluations,
         figure_dir,
         x_col="test_fairness",
         xlabel=UNFAIRNESS_AXIS_LABEL,
@@ -2819,6 +2703,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     plot_cost_unfairness_projection(final_evaluations, figure_dir)
     plot_three_objective_pareto(final_evaluations, figure_dir)
+    plot_three_objective_pareto_improved(final_evaluations, figure_dir)
     plot_method_comparison_bars(final_metrics, figure_dir)
     plot_fairness_readiness_diagnostics(
         final_raw_evaluations,
