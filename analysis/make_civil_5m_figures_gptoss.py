@@ -22,18 +22,20 @@ Key safeguards
 6. Cost labels describe the configured GPT-OSS objective
    ``0.12 × mean input tokens + 0.49 × mean output tokens``. They are not
    Rocket GPU charges and are not dollar costs.
-7. The accuracy–cost and accuracy–unfairness comparison figures use the
-   explicitly approved per-seed extrema in ``APPROVED_EXTREMA_BY_SEED``. The
-   script verifies that they reproduce the supplied three-seed mean ± sample SD
-   before drawing either figure.
+7. The accuracy–cost and accuracy–unfairness figures are computed from the
+   candidate-level final-checkpoint ``eval.parquet`` rows.  They show all actual
+   evaluated candidates, per-seed Pareto-front trajectories, the pooled
+   two-objective Pareto envelope, and the across-seed empirical-attainment
+   summary.  No hand-entered per-seed extrema are substituted for the evaluated
+   candidates.
 
 Default usage on Rocket::
 
     python -m analysis.make_civil_5m_figures_gptoss --rebuild-analysis --strict
 
 Generated outputs include development anytime trajectories, exact 5M
-multi-objective comparisons, fairness-ready Pareto figures, approved
-accuracy–cost and accuracy–unfairness comparisons, readiness diagnostics,
+multi-objective comparisons, fairness-ready Pareto and empirical-attainment
+figures, readiness diagnostics,
 high-accuracy operating-point comparisons,
 CSV/Markdown tables, and a selected-run manifest.
 """
@@ -57,7 +59,7 @@ import numpy as np
 import pandas as pd
 
 
-ANALYSIS_SCHEMA_VERSION = 4
+ANALYSIS_SCHEMA_VERSION = 5
 MODEL = "gpt-oss-120b"
 MODEL_DISPLAY = "GPT-OSS-120B"
 DATASET = "civil_comments"
@@ -94,85 +96,6 @@ MARKERS = {
     "NSGAII-PO-Fair": "s",
 }
 
-# Approved Civil Comments 5M extrema supplied for the two accuracy comparison
-# figures. These are marginal extrema: best accuracy, lowest unfairness, and
-# lowest cost can come from different evaluated prompts within the same run.
-APPROVED_EXTREMA_BY_SEED: tuple[dict[str, object], ...] = (
-    {
-        "optimizer": "Tri-Fair",
-        "seed": 42,
-        "eval_rows": 18,
-        "best_accuracy": 0.8440,
-        "lowest_unfairness": 0.0566,
-        "lowest_cost": 31.6941,
-        "actual_run_tokens": 4_972_501,
-        "utilization_percent": 99.450,
-    },
-    {
-        "optimizer": "Tri-Fair",
-        "seed": 43,
-        "eval_rows": 13,
-        "best_accuracy": 0.8700,
-        "lowest_unfairness": 0.0504,
-        "lowest_cost": 35.9131,
-        "actual_run_tokens": 4_939_065,
-        "utilization_percent": 98.781,
-    },
-    {
-        "optimizer": "Tri-Fair",
-        "seed": 44,
-        "eval_rows": 12,
-        "best_accuracy": 0.8580,
-        "lowest_unfairness": 0.0460,
-        "lowest_cost": 33.7178,
-        "actual_run_tokens": 4_971_113,
-        "utilization_percent": 99.422,
-    },
-    {
-        "optimizer": "NSGAII-PO-Fair",
-        "seed": 42,
-        "eval_rows": 18,
-        "best_accuracy": 0.8160,
-        "lowest_unfairness": 0.0974,
-        "lowest_cost": 37.9460,
-        "actual_run_tokens": 4_983_267,
-        "utilization_percent": 99.665,
-    },
-    {
-        "optimizer": "NSGAII-PO-Fair",
-        "seed": 43,
-        "eval_rows": 14,
-        "best_accuracy": 0.8340,
-        "lowest_unfairness": 0.0881,
-        "lowest_cost": 38.7190,
-        "actual_run_tokens": 4_985_501,
-        "utilization_percent": 99.710,
-    },
-    {
-        "optimizer": "NSGAII-PO-Fair",
-        "seed": 44,
-        "eval_rows": 20,
-        "best_accuracy": 0.8280,
-        "lowest_unfairness": 0.0950,
-        "lowest_cost": 36.7218,
-        "actual_run_tokens": 4_980_430,
-        "utilization_percent": 99.609,
-    },
-)
-
-APPROVED_AGGREGATE_EXTREMA = {
-    "Tri-Fair": {
-        "best_accuracy": (0.8573, 0.0130),
-        "lowest_unfairness": (0.0510, 0.0053),
-        "lowest_cost": (33.7750, 2.1101),
-    },
-    "NSGAII-PO-Fair": {
-        "best_accuracy": (0.8260, 0.0092),
-        "lowest_unfairness": (0.0935, 0.0048),
-        "lowest_cost": (37.7956, 1.0071),
-    },
-}
-
 
 @dataclass(frozen=True)
 class CostBounds:
@@ -187,132 +110,6 @@ class CostBounds:
         out[:, 1] = np.clip(out[:, 1] / self.cost_max, 0.0, 1.1)
         out[:, 2] = np.clip(out[:, 2], 0.0, 1.0)
         return out
-
-
-def approved_extrema_frame() -> pd.DataFrame:
-    """Return and validate the six approved Civil Comments marginal extrema."""
-    frame = pd.DataFrame(APPROVED_EXTREMA_BY_SEED)
-    expected_pairs = {
-        (optimizer, seed)
-        for optimizer in OPTIMIZER_ORDER
-        for seed in EXPECTED_SEEDS
-    }
-    observed_pairs = {
-        (str(row.optimizer), int(row.seed))
-        for row in frame[["optimizer", "seed"]].itertuples(index=False)
-    }
-    if observed_pairs != expected_pairs or len(frame) != len(expected_pairs):
-        raise RuntimeError(
-            "APPROVED_EXTREMA_BY_SEED must contain exactly one row for every "
-            f"method/seed pair; observed={sorted(observed_pairs)}"
-        )
-
-    numeric_columns = (
-        "best_accuracy",
-        "lowest_unfairness",
-        "lowest_cost",
-        "actual_run_tokens",
-        "utilization_percent",
-    )
-    for column in numeric_columns:
-        frame[column] = pd.to_numeric(frame[column], errors="raise")
-    frame["seed"] = pd.to_numeric(frame["seed"], errors="raise").astype(int)
-    frame["eval_rows"] = pd.to_numeric(
-        frame["eval_rows"], errors="raise"
-    ).astype(int)
-
-    for optimizer in OPTIMIZER_ORDER:
-        group = frame[frame["optimizer"] == optimizer].sort_values("seed")
-        if tuple(group["seed"]) != EXPECTED_SEEDS:
-            raise RuntimeError(
-                f"Approved extrema for {optimizer} do not contain seeds "
-                f"{EXPECTED_SEEDS}: {group['seed'].tolist()}"
-            )
-        expected = APPROVED_AGGREGATE_EXTREMA[optimizer]
-        for metric in ("best_accuracy", "lowest_unfairness", "lowest_cost"):
-            values = group[metric].to_numpy(dtype=float)
-            observed_mean = float(values.mean())
-            observed_sd = float(values.std(ddof=1))
-            expected_mean, expected_sd = expected[metric]
-            if not (
-                math.isclose(
-                    observed_mean,
-                    float(expected_mean),
-                    rel_tol=0.0,
-                    abs_tol=5e-5,
-                )
-                and math.isclose(
-                    observed_sd,
-                    float(expected_sd),
-                    rel_tol=0.0,
-                    abs_tol=5e-5,
-                )
-            ):
-                raise RuntimeError(
-                    f"Approved {optimizer} {metric} values produce "
-                    f"{observed_mean:.4f} ± {observed_sd:.4f}, expected "
-                    f"{expected_mean:.4f} ± {expected_sd:.4f}"
-                )
-    return frame.sort_values(["optimizer", "seed"]).reset_index(drop=True)
-
-
-def approved_aggregate_frame(per_seed: pd.DataFrame) -> pd.DataFrame:
-    """Summarize the approved extrema as mean ± sample SD across three seeds."""
-    rows: list[dict[str, object]] = []
-    for optimizer in OPTIMIZER_ORDER:
-        group = per_seed[per_seed["optimizer"] == optimizer]
-        row: dict[str, object] = {
-            "optimizer": optimizer,
-            "method": DISPLAY_NAME[optimizer],
-            "n_seeds": int(group["seed"].nunique()),
-        }
-        for metric in ("best_accuracy", "lowest_unfairness", "lowest_cost"):
-            values = group[metric].to_numpy(dtype=float)
-            row[f"{metric}_mean"] = float(values.mean())
-            row[f"{metric}_sample_sd"] = float(values.std(ddof=1))
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def validate_approved_eval_rows(
-    approved: pd.DataFrame,
-    final_raw_evaluations: pd.DataFrame,
-) -> None:
-    """Ensure the approved table is being applied to the intended six runs."""
-    require_columns(
-        final_raw_evaluations,
-        ["optimizer", "seed"],
-        "raw final Civil Comments evaluations",
-    )
-    observed = (
-        final_raw_evaluations.assign(
-            seed=lambda frame: pd.to_numeric(
-                frame["seed"], errors="raise"
-            ).astype(int)
-        )
-        .groupby(["optimizer", "seed"], as_index=False)
-        .size()
-        .rename(columns={"size": "observed_eval_rows"})
-    )
-    expected = approved[
-        ["optimizer", "seed", "eval_rows"]
-    ].rename(columns={"eval_rows": "expected_eval_rows"})
-    comparison = expected.merge(
-        observed,
-        on=["optimizer", "seed"],
-        how="outer",
-        validate="one_to_one",
-    )
-    mismatch = comparison[
-        comparison["expected_eval_rows"]
-        != comparison["observed_eval_rows"]
-    ]
-    if not mismatch.empty:
-        raise RuntimeError(
-            "Approved Civil Comments extrema do not match the loaded six-run "
-            "evaluation grid:\n"
-            + mismatch.to_string(index=False)
-        )
 
 
 def parse_csv_ints(raw: str | Iterable[int]) -> tuple[int, ...]:
@@ -936,7 +733,7 @@ def rebuild_analysis_outputs(
     overwrite_bounds: bool,
     strict: bool,
 ) -> None:
-    """Rebuild exact GPT-OSS tables and recompute coverage-valid metrics."""
+    """Rebuild exact GPT-OSS tables and recompute fairness-ready metrics."""
     if not results_root.is_dir():
         raise FileNotFoundError(
             f"Results root does not exist: {results_root}\n"
@@ -1952,6 +1749,127 @@ def test_objective_matrix(frame: pd.DataFrame) -> np.ndarray:
     return np.column_stack([1.0 - quality, cost, fairness])
 
 
+def candidate_trajectory_table(final: pd.DataFrame) -> pd.DataFrame:
+    """Order and audit the final holdout candidates for trajectory plots.
+
+    ``eval.parquet`` stores the selected holdout candidates in evaluation
+    order and also records their originating optimizer ``time`` and ``step``.
+    The generic loader may concatenate runs in a different order, so this
+    helper reconstructs a stable sequence within each method/seed run.  It also
+    records the three-objective and two projected Pareto memberships used by
+    the two accuracy trade-off figures.
+    """
+
+    require_columns(
+        final,
+        [
+            "optimizer",
+            "seed",
+            "test_quality",
+            "test_cost",
+            "test_fairness",
+        ],
+        "final candidate evaluations",
+    )
+
+    ordered_groups: list[pd.DataFrame] = []
+    expected_pairs = {
+        (optimizer, seed)
+        for optimizer in OPTIMIZER_ORDER
+        for seed in EXPECTED_SEEDS
+    }
+    observed_pairs: set[tuple[str, int]] = set()
+
+    for (optimizer, seed), source_group in final.groupby(
+        ["optimizer", "seed"],
+        sort=True,
+        dropna=False,
+    ):
+        optimizer_name = str(optimizer)
+        seed_value = int(seed)
+        observed_pairs.add((optimizer_name, seed_value))
+
+        group = source_group.copy()
+        group["_source_row_order"] = np.arange(len(group), dtype=int)
+        sort_columns: list[str] = []
+
+        if "time" in group:
+            group["_trajectory_time"] = pd.to_numeric(
+                group["time"],
+                errors="coerce",
+            )
+            sort_columns.append("_trajectory_time")
+        if "step" in group:
+            group["_trajectory_step"] = pd.to_numeric(
+                group["step"],
+                errors="coerce",
+            )
+            sort_columns.append("_trajectory_step")
+        sort_columns.append("_source_row_order")
+
+        group = group.sort_values(
+            sort_columns,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+        group["candidate_order"] = np.arange(1, len(group) + 1, dtype=int)
+
+        objective_3d = test_objective_matrix(group)
+        valid_3d = np.all(np.isfinite(objective_3d), axis=1)
+        group["pareto_3d"] = False
+        if np.any(valid_3d):
+            group.loc[valid_3d, "pareto_3d"] = pareto_mask_minimize(
+                objective_3d[valid_3d]
+            )
+
+        for x_col, flag_column in (
+            ("test_cost", "pareto_accuracy_cost_2d"),
+            ("test_fairness", "pareto_accuracy_unfairness_2d"),
+        ):
+            x = finite_numeric(group[x_col])
+            y = finite_numeric(group["test_quality"])
+            objective_2d = np.column_stack([x, 1.0 - y])
+            valid_2d = np.all(np.isfinite(objective_2d), axis=1)
+            group[flag_column] = False
+            if np.any(valid_2d):
+                group.loc[valid_2d, flag_column] = pareto_mask_minimize(
+                    objective_2d[valid_2d]
+                )
+
+        group = group.drop(
+            columns=[
+                "_source_row_order",
+                "_trajectory_time",
+                "_trajectory_step",
+            ],
+            errors="ignore",
+        )
+        ordered_groups.append(group)
+
+    if observed_pairs != expected_pairs:
+        missing = sorted(expected_pairs - observed_pairs)
+        extra = sorted(observed_pairs - expected_pairs)
+        raise RuntimeError(
+            "Candidate trajectories require the complete six-run grid; "
+            f"missing={missing}, extra={extra}"
+        )
+    if not ordered_groups:
+        raise RuntimeError("No final holdout candidates are available for trajectories")
+
+    trajectories = pd.concat(ordered_groups, ignore_index=True)
+    counts = trajectories.groupby(["optimizer", "seed"], sort=True).size()
+    if (counts < 2).any():
+        too_short = {
+            (str(optimizer), int(seed)): int(count)
+            for (optimizer, seed), count in counts[counts < 2].items()
+        }
+        raise RuntimeError(
+            "Each candidate trajectory requires at least two evaluated points; "
+            f"found={too_short}"
+        )
+    return trajectories
+
+
 def y_attained_at_x(data: pd.DataFrame, x_grid: np.ndarray, x_col: str) -> np.ndarray:
     x = finite_numeric(data[x_col])
     y = finite_numeric(data["test_quality"])
@@ -1974,6 +1892,19 @@ def plot_empirical_attainment(
     xlabel: str,
     filename: str,
 ) -> None:
+    """Plot observed candidate paths and the seed-level attainment summary."""
+
+    require_columns(
+        final,
+        [
+            "optimizer",
+            "seed",
+            "candidate_order",
+            "test_quality",
+            x_col,
+        ],
+        f"{x_col} candidate trajectories",
+    )
     xmin = float(np.nanmin(finite_numeric(final[x_col])))
     xmax = float(np.nanmax(finite_numeric(final[x_col])))
     padding = 0.03 * max(xmax - xmin, 1e-6)
@@ -1988,6 +1919,53 @@ def plot_empirical_attainment(
             seed_group = seed_group.loc[valid].reset_index(drop=True)
             if seed_group.empty:
                 continue
+
+            # Small translucent points expose all actual eval.parquet
+            # candidates. The thin path connects this seed's observed
+            # two-objective Pareto front; sorting by the horizontal objective
+            # keeps the trade-off trajectory readable instead of drawing a
+            # misleading zig-zag through dominated candidates.
+            sequence = seed_group.sort_values(
+                "candidate_order",
+                kind="stable",
+            )
+            ax.scatter(
+                finite_numeric(sequence[x_col]),
+                finite_numeric(sequence["test_quality"]),
+                color=COLORS[optimizer],
+                marker=MARKERS[optimizer],
+                s=18,
+                alpha=0.32,
+                linewidths=0.0,
+                zorder=3,
+            )
+
+            flag_column = (
+                "pareto_accuracy_cost_2d"
+                if x_col == "test_cost"
+                else "pareto_accuracy_unfairness_2d"
+            )
+            seed_front_2d = (
+                seed_group[seed_group[flag_column].fillna(False).astype(bool)]
+                .drop_duplicates(subset=[x_col, "test_quality"])
+                .sort_values(
+                    [x_col, "test_quality"],
+                    ascending=[True, True],
+                    kind="stable",
+                )
+            )
+            if not seed_front_2d.empty:
+                ax.plot(
+                    finite_numeric(seed_front_2d[x_col]),
+                    finite_numeric(seed_front_2d["test_quality"]),
+                    color=COLORS[optimizer],
+                    marker=MARKERS[optimizer],
+                    linewidth=0.9,
+                    markersize=3.2,
+                    alpha=0.36,
+                    zorder=3,
+                )
+
             front = seed_group.loc[pareto_mask_minimize(test_objective_matrix(seed_group))]
             curves.append(y_attained_at_x(front, x_grid, x_col))
         if not curves:
@@ -2013,126 +1991,45 @@ def plot_empirical_attainment(
         ax.fill_between(
             x_grid[valid], lower[valid], upper[valid], step="post", color=COLORS[optimizer], alpha=0.16
         )
-    ax.set_title("Civil Comments — GPT-OSS-120B at 5M")
+
+        # Overlay the observed pooled two-objective envelope. Unlike the
+        # median attainment step, every marker on this line is a real evaluated
+        # candidate from eval.parquet.
+        x = finite_numeric(optimizer_data[x_col])
+        y = finite_numeric(optimizer_data["test_quality"])
+        objective_2d = np.column_stack([x, 1.0 - y])
+        valid_2d = np.all(np.isfinite(objective_2d), axis=1)
+        if np.any(valid_2d):
+            pooled = optimizer_data.loc[valid_2d].copy()
+            pooled = pooled.loc[
+                pareto_mask_minimize(objective_2d[valid_2d])
+            ].sort_values(
+                [x_col, "test_quality"],
+                ascending=[True, True],
+                kind="stable",
+            )
+            ax.plot(
+                finite_numeric(pooled[x_col]),
+                finite_numeric(pooled["test_quality"]),
+                color=COLORS[optimizer],
+                marker=MARKERS[optimizer],
+                markerfacecolor=COLORS[optimizer],
+                markeredgecolor="white",
+                markeredgewidth=0.7,
+                linewidth=1.5,
+                markersize=5.5,
+                alpha=0.95,
+                zorder=5,
+            )
+
+    ax.set_title(
+        "Civil Comments — GPT-OSS-120B at 5M\n"
+        "Evaluated Candidates, Seed Fronts, and Empirical Attainment"
+    )
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Test Accuracy")
     ax.grid(True, alpha=0.25)
     ax.legend(frameon=False, loc="lower right")
-    save_figure(fig, outdir, filename)
-
-
-def plot_approved_extrema_comparison(
-    approved: pd.DataFrame,
-    outdir: Path,
-    *,
-    x_col: str,
-    xlabel: str,
-    filename: str,
-) -> None:
-    """Plot the approved per-seed marginal extrema and three-seed summaries.
-
-    The x and y values are independently selected marginal extrema. They are
-    shown together only to compare method-level outcomes compactly; the note in
-    the figure prevents interpreting a marker as one jointly attainable prompt.
-    """
-    require_columns(
-        approved,
-        ["optimizer", "seed", "best_accuracy", x_col],
-        "approved Civil Comments extrema",
-    )
-    fig, ax = plt.subplots(figsize=(7.2, 4.8), constrained_layout=True)
-    annotation_lines = ["Mean ± sample SD (n = 3)"]
-
-    for optimizer in OPTIMIZER_ORDER:
-        group = approved[approved["optimizer"] == optimizer].sort_values("seed")
-        x = pd.to_numeric(group[x_col], errors="raise").to_numpy(dtype=float)
-        y = pd.to_numeric(
-            group["best_accuracy"], errors="raise"
-        ).to_numpy(dtype=float)
-        seeds = pd.to_numeric(group["seed"], errors="raise").to_numpy(dtype=int)
-        if len(group) != len(EXPECTED_SEEDS) or not np.all(
-            np.isfinite(np.column_stack([x, y]))
-        ):
-            raise RuntimeError(
-                f"Approved {optimizer} data are incomplete or non-finite for {x_col}"
-            )
-
-        ax.scatter(
-            x,
-            y,
-            s=58,
-            facecolors="white",
-            edgecolors=COLORS[optimizer],
-            marker=MARKERS[optimizer],
-            linewidths=1.6,
-            zorder=4,
-        )
-        for x_value, y_value, seed in zip(x, y, seeds):
-            ax.annotate(
-                str(seed),
-                xy=(x_value, y_value),
-                xytext=(0, 7),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=7.5,
-                color=COLORS[optimizer],
-            )
-
-        x_mean = float(x.mean())
-        x_sd = float(x.std(ddof=1))
-        y_mean = float(y.mean())
-        y_sd = float(y.std(ddof=1))
-        ax.errorbar(
-            x_mean,
-            y_mean,
-            xerr=x_sd,
-            yerr=y_sd,
-            fmt="D",
-            markersize=8,
-            markerfacecolor=COLORS[optimizer],
-            markeredgecolor="white",
-            markeredgewidth=0.9,
-            color=COLORS[optimizer],
-            ecolor=COLORS[optimizer],
-            elinewidth=1.8,
-            capsize=5,
-            capthick=1.4,
-            label=DISPLAY_NAME[optimizer],
-            zorder=5,
-        )
-        annotation_lines.append(
-            f"{DISPLAY_NAME[optimizer]}: accuracy {y_mean:.4f} ± {y_sd:.4f}; "
-            f"{x_col.replace('_', ' ')} {x_mean:.4f} ± {x_sd:.4f}"
-        )
-    annotation_lines.extend(
-        [
-            "",
-            "Marginal extrema are independent and need not come from the same prompt.",
-        ]
-    )
-
-    ax.set_title("Civil Comments — GPT-OSS-120B at 5M")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Best Test Accuracy ↑")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False, loc="best")
-    ax.text(
-        0.02,
-        0.02,
-        "\n".join(annotation_lines),
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=7.6,
-        color="0.25",
-        bbox={
-            "boxstyle": "round,pad=0.35",
-            "facecolor": "white",
-            "edgecolor": "0.75",
-            "alpha": 0.92,
-        },
-    )
     save_figure(fig, outdir, filename)
 
 
@@ -2595,7 +2492,6 @@ def write_summary_tables(
     outdir: Path,
 ) -> None:
     readiness = fairness_readiness_summary(final_raw_evaluations)
-    approved = approved_extrema_frame()
     best_points = best_quality_points(final_evaluations)
     rows: list[dict[str, object]] = []
     for optimizer in OPTIMIZER_ORDER:
@@ -2609,7 +2505,6 @@ def write_summary_tables(
             high_accuracy_points["optimizer"] == optimizer
         ]
         readiness_method = readiness[readiness["optimizer"] == optimizer]
-        approved_method = approved[approved["optimizer"] == optimizer]
         rows.append(
             {
                 "Method": DISPLAY_NAME[optimizer],
@@ -2630,29 +2525,11 @@ def write_summary_tables(
                 "Balanced test unfairness mean ↓": metrics[
                     "balanced_test_fairness"
                 ].mean(),
-                "Approved best accuracy mean ↑": approved_method[
-                    "best_accuracy"
-                ].mean(),
-                "Approved best accuracy SD": approved_method[
-                    "best_accuracy"
-                ].std(ddof=1),
-                "Approved lowest cost mean ↓": approved_method[
-                    "lowest_cost"
-                ].mean(),
-                "Approved lowest cost SD": approved_method[
-                    "lowest_cost"
-                ].std(ddof=1),
-                "Approved lowest unfairness mean ↓": approved_method[
-                    "lowest_unfairness"
-                ].mean(),
-                "Approved lowest unfairness SD": approved_method[
-                    "lowest_unfairness"
-                ].std(ddof=1),
-                "Raw best-quality point mean accuracy ↑": best[
+                "Best-quality point mean accuracy ↑": best[
                     "test_quality"
                 ].mean(),
-                "Raw best-quality point mean cost ↓": best["test_cost"].mean(),
-                "Raw best-quality point mean unfairness ↓": best[
+                "Best-quality point mean cost ↓": best["test_cost"].mean(),
+                "Best-quality point mean unfairness ↓": best[
                     "test_fairness"
                 ].mean(),
                 "High-accuracy point mean accuracy ↑": high["test_quality"].mean(),
@@ -2722,16 +2599,18 @@ It is not a dollar amount and is not the Rocket GPU bill.
 - `civil_comments_gptoss120b_5m_final_nr2_development_and_holdout.*`: Panel A is the development-only anytime proxy; Panel B shows the exact 5M holdout nR2 for seeds 42, 43, and 44 with method mean ± SD in the legend.
 - Fairness-unready rows are excluded from main publication figures and retained in `all_evaluations_raw.parquet` and the readiness diagnostic figure.
 
-## Approved extrema used by the two accuracy figures
+## Accuracy attainment figures
 
-The accuracy–cost and accuracy–unfairness figures use the approved per-seed
-marginal extrema saved in
-`civil_comments_gptoss120b_5m_final_approved_extrema_by_seed.csv`.
-Best accuracy, lowest cost, and lowest unfairness can come from different
-prompts; the figure note makes that distinction explicit.
+The accuracy–cost and accuracy–unfairness figures are empirical attainment
+curves computed from the final-checkpoint, fairness-ready candidate rows loaded
+from each run's `eval.parquet`.  Translucent points expose every actual
+candidate. Thin paths connect each seed's observed two-objective Pareto front,
+and the outlined method path connects the pooled observed two-objective Pareto
+envelope. The thick step curve remains the median seed-level attainment curve,
+with the across-seed range as a shaded band.
 
-- Tri-Fair: best accuracy `0.8573 ± 0.0130`, lowest unfairness `0.0510 ± 0.0053`, lowest cost `33.7750 ± 2.1101`
-- NSGA-II-PO-Fair: best accuracy `0.8260 ± 0.0092`, lowest unfairness `0.0935 ± 0.0048`, lowest cost `37.7956 ± 1.0071`
+The exact plotted rows and their reconstructed order are exported to
+`civil_comments_gptoss120b_5m_final_candidate_trajectories.csv`.
 
 ## Main figure files
 
@@ -2780,9 +2659,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         budgets = tuple(sorted(set(budgets + (FINAL_BUDGET,))))
     cost_upper_bound = float(args.cost_upper_bound)
     high_accuracy_threshold = float(args.high_accuracy_threshold)
-    approved_extrema = approved_extrema_frame()
-    approved_aggregate = approved_aggregate_frame(approved_extrema)
-
     needs_rebuild = args.rebuild_analysis or not analysis_has_5m(
         analysis_dir,
         results_root=results_root,
@@ -2812,10 +2688,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     selected = selected_final_runs(run_metrics)
     final_evaluations = final_checkpoint_evaluations(evaluations, selected)
     final_raw_evaluations = final_checkpoint_evaluations(raw_evaluations, selected)
-    validate_approved_eval_rows(
-        approved_extrema,
-        final_raw_evaluations,
-    )
+    candidate_trajectories = candidate_trajectory_table(final_evaluations)
     checkpoint_metrics = complete_checkpoint_metrics(
         checkpoint_run_metrics(run_metrics)
     )
@@ -2855,6 +2728,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     max_plot_budget = int(math.ceil(max_actual_tokens / 50_000.0) * 50_000)
 
     figure_dir.mkdir(parents=True, exist_ok=True)
+    # Remove outputs created by the earlier hard-coded extrema implementation
+    # so a rebuilt directory cannot imply that those values still drive the
+    # empirical-attainment figures.
+    for obsolete_name in (
+        "civil_comments_gptoss120b_5m_final_approved_extrema_by_seed.csv",
+        "civil_comments_gptoss120b_5m_final_approved_extrema_aggregate.csv",
+        "civil_comments_gptoss120b_5m_final_approved_extrema_aggregate.md",
+    ):
+        (figure_dir / obsolete_name).unlink(missing_ok=True)
+
     selected.to_csv(
         figure_dir / "civil_comments_gptoss120b_5m_final_selected_runs.csv", index=False
     )
@@ -2869,25 +2752,36 @@ def main(argv: Sequence[str] | None = None) -> None:
         figure_dir / "civil_comments_gptoss120b_5m_final_raw_final_evaluations.parquet",
         index=False,
     )
+    trajectory_audit_columns = [
+        column
+        for column in (
+            "optimizer",
+            "seed",
+            "candidate_order",
+            "step",
+            "time",
+            "prompt_id",
+            "is_incumbent",
+            "selection_policy",
+            "test_quality",
+            "test_cost",
+            "test_fairness",
+            "test_fairness_ready",
+            "pareto_3d",
+            "pareto_accuracy_cost_2d",
+            "pareto_accuracy_unfairness_2d",
+            "run_key",
+            "run_dir",
+        )
+        if column in candidate_trajectories
+    ]
+    candidate_trajectories[trajectory_audit_columns].to_csv(
+        figure_dir
+        / "civil_comments_gptoss120b_5m_final_candidate_trajectories.csv",
+        index=False,
+    )
     step_proxy.to_csv(
         figure_dir / "civil_comments_gptoss120b_5m_final_stepwise_dev_nr2_proxy.csv", index=False
-    )
-    approved_extrema.to_csv(
-        figure_dir
-        / "civil_comments_gptoss120b_5m_final_approved_extrema_by_seed.csv",
-        index=False,
-    )
-    approved_aggregate.to_csv(
-        figure_dir
-        / "civil_comments_gptoss120b_5m_final_approved_extrema_aggregate.csv",
-        index=False,
-    )
-    (
-        figure_dir
-        / "civil_comments_gptoss120b_5m_final_approved_extrema_aggregate.md"
-    ).write_text(
-        approved_aggregate.to_markdown(index=False, floatfmt=".4f") + "\n",
-        encoding="utf-8",
     )
 
     plot_nr2_development_and_holdout(
@@ -2909,17 +2803,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     plot_exact_checkpoint_mo_metrics(checkpoint_metrics, figure_dir)
     plot_balanced_budget_trajectory(checkpoint_metrics, figure_dir)
-    plot_approved_extrema_comparison(
-        approved_extrema,
+    plot_empirical_attainment(
+        candidate_trajectories,
         figure_dir,
-        x_col="lowest_cost",
+        x_col="test_cost",
         xlabel=COST_AXIS_LABEL,
         filename="civil_comments_gptoss120b_5m_final_attainment_accuracy_cost",
     )
-    plot_approved_extrema_comparison(
-        approved_extrema,
+    plot_empirical_attainment(
+        candidate_trajectories,
         figure_dir,
-        x_col="lowest_unfairness",
+        x_col="test_fairness",
         xlabel=UNFAIRNESS_AXIS_LABEL,
         filename="civil_comments_gptoss120b_5m_final_attainment_accuracy_unfairness",
     )
