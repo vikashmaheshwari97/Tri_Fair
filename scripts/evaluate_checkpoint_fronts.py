@@ -1,0 +1,348 @@
+"""Evaluate development-selected checkpoint fronts on the fixed v3 holdout set.
+
+The optimizer is never given holdout feedback.  After a run is complete, this
+script maps token checkpoints to logged steps, selects candidates using only
+development history, evaluates each unique prompt once on holdout data, and
+writes a checkpoint-aware parquet table for exact nR2/HV/gap analysis.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from promptolution.predictors import MarkerBasedPredictor
+
+from scripts._common import (
+    atomic_write_parquet,
+    configure_logging,
+    prompt_id,
+    reconstruct_prompts,
+    set_generation_limit,
+    sha256_file,
+    stable_latest_per_prompt,
+    utc_now_iso,
+)
+from scripts.evaluate_prompts import _rename_development_columns, load_prompt_candidates
+from src.config.dataset_configs import ALL_DATASETS
+from src.config.model_configs import ALL_MODELS
+from src.config.setup_config import SETUP
+from src.config.v3_profiles import apply_v3_dataset_profile
+from src.helpers.llm_creation import create_llm
+from src.helpers.task_creation import create_test_task
+from src.utils import seed_everything
+
+LOGGER = logging.getLogger(__name__)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log-path", required=True)
+    parser.add_argument("--dataset", choices=sorted(ALL_DATASETS), default=None)
+    parser.add_argument("--model", choices=sorted(ALL_MODELS), default=None)
+    parser.add_argument("--random-seed", type=int, default=None)
+    parser.add_argument(
+        "--checkpoints",
+        default="2000000,3000000,4000000,5000000",
+    )
+    parser.add_argument(
+        "--selection",
+        choices=("current", "current_incumbents", "incumbents", "current_and_incumbents"),
+        default="current_incumbents",
+    )
+    parser.add_argument("--minimum-checkpoint-utilization", type=float, default=0.90)
+    parser.add_argument("--manifest-dir", default="data/splits_v3")
+    parser.add_argument("--max-output-tokens", type=int, default=16)
+    parser.add_argument("--output-file", default="eval_checkpoints.parquet")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--log-level", default="INFO")
+    return parser.parse_args()
+
+
+def _positive_csv(raw: str) -> list[int]:
+    values = sorted(
+        {
+            int(piece.strip().replace("_", ""))
+            for piece in str(raw).split(",")
+            if piece.strip()
+        }
+    )
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("--checkpoints must contain positive integers")
+    return values
+
+
+def _run_metadata(log_path: Path) -> dict[str, object]:
+    path = log_path / "args.json"
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    return value if isinstance(value, dict) else {}
+
+
+def _resolve_identity(args: argparse.Namespace, log_path: Path) -> tuple[str, str, int, str]:
+    metadata = _run_metadata(log_path)
+    dataset = str(args.dataset or metadata.get("dataset") or "")
+    model = str(args.model or metadata.get("model") or "")
+    seed_raw = args.random_seed if args.random_seed is not None else metadata.get("random_seed")
+    optimizer = str(metadata.get("optimizer") or "unknown")
+    if dataset not in ALL_DATASETS:
+        raise ValueError(f"Could not resolve dataset from {log_path}/args.json")
+    if model not in ALL_MODELS:
+        raise ValueError(f"Could not resolve model from {log_path}/args.json")
+    if seed_raw is None:
+        raise ValueError(f"Could not resolve random seed from {log_path}/args.json")
+    return dataset, model, int(seed_raw), optimizer
+
+
+def _step_token_table(frame: pd.DataFrame) -> pd.Series:
+    if "total_tokens_downstream" in frame:
+        tokens = pd.to_numeric(frame["total_tokens_downstream"], errors="coerce")
+    else:
+        input_source = (
+            frame["input_tokens_downstream"]
+            if "input_tokens_downstream" in frame
+            else pd.Series(0, index=frame.index, dtype=float)
+        )
+        output_source = (
+            frame["output_tokens_downstream"]
+            if "output_tokens_downstream" in frame
+            else pd.Series(0, index=frame.index, dtype=float)
+        )
+        input_tokens = pd.to_numeric(input_source, errors="coerce").fillna(0)
+        output_tokens = pd.to_numeric(output_source, errors="coerce").fillna(0)
+        tokens = input_tokens + output_tokens
+    work = frame.assign(_tokens=tokens)
+    return work.groupby("step", sort=True)["_tokens"].max().dropna().astype(int)
+
+
+def _checkpoint_steps(
+    frame: pd.DataFrame,
+    checkpoints: list[int],
+    minimum_utilization: float,
+) -> list[tuple[int, int, int]]:
+    if not 0.0 < minimum_utilization <= 1.0:
+        raise ValueError("--minimum-checkpoint-utilization must lie in (0, 1]")
+    per_step = _step_token_table(frame)
+    rows: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for checkpoint in checkpoints:
+        eligible = per_step[per_step <= checkpoint]
+        if eligible.empty:
+            continue
+        chosen_step = int(eligible.index[-1])
+        actual = int(eligible.iloc[-1])
+        if actual < minimum_utilization * checkpoint:
+            LOGGER.warning(
+                "Skipping checkpoint %d: latest completed step has only %d tokens",
+                checkpoint,
+                actual,
+            )
+            continue
+        key = (checkpoint, chosen_step)
+        if key not in seen:
+            rows.append((checkpoint, chosen_step, actual))
+            seen.add(key)
+    if not rows:
+        raise RuntimeError("No logged step satisfies the requested checkpoint rules")
+    return rows
+
+
+def _test_columns(frame: pd.DataFrame) -> list[str]:
+    return [
+        column
+        for column in frame.columns
+        if column.startswith("test_")
+        or column
+        in {
+            "prompt_id",
+            "evaluation_timestamp",
+            "manifest_path",
+            "manifest_sha256",
+        }
+    ]
+
+
+def run(args: argparse.Namespace) -> Path:
+    if args.max_output_tokens <= 0:
+        raise ValueError("--max-output-tokens must be positive")
+    log_path = Path(args.log_path).expanduser().resolve()
+    step_path = log_path / "step_results.parquet"
+    if not step_path.is_file():
+        raise FileNotFoundError(step_path)
+
+    dataset, model, seed, optimizer = _resolve_identity(args, log_path)
+    step_frame = pd.read_parquet(step_path)
+    checkpoint_rows = _checkpoint_steps(
+        step_frame,
+        _positive_csv(args.checkpoints),
+        float(args.minimum_checkpoint_utilization),
+    )
+
+    membership_frames: list[pd.DataFrame] = []
+    for checkpoint, chosen_step, actual_tokens in checkpoint_rows:
+        loader_selection = (
+            "current" if args.selection == "current_incumbents" else args.selection
+        )
+        selected, resolved_step = load_prompt_candidates(
+            log_path,
+            step=chosen_step,
+            selection=loader_selection,
+        )
+        if args.selection == "current_incumbents":
+            if "is_incumbent" not in selected:
+                raise ValueError(
+                    "step_results.parquet lacks is_incumbent, so the current archive "
+                    "cannot be reconstructed"
+                )
+            selected = selected[
+                selected["is_incumbent"].fillna(False).astype(bool)
+            ].reset_index(drop=True)
+            if selected.empty:
+                raise RuntimeError(
+                    f"No current incumbents were logged at step {resolved_step}"
+                )
+            selected["selection_policy"] = "current_incumbents"
+        selected = _rename_development_columns(selected)
+        selected["budget_checkpoint"] = int(checkpoint)
+        selected["actual_budget_tokens"] = int(actual_tokens)
+        selected["chosen_step"] = int(resolved_step)
+        selected["model"] = model
+        selected["dataset"] = dataset
+        selected["optimizer"] = optimizer
+        selected["seed"] = seed
+        metadata = _run_metadata(log_path)
+        selected["configured_budget"] = int(
+            metadata.get("budget_per_run", checkpoint)
+        )
+        if "prompt_id" not in selected:
+            selected["prompt_id"] = selected["prompt"].astype(str).map(prompt_id)
+        membership_frames.append(selected)
+
+    membership = pd.concat(membership_frames, ignore_index=True, sort=False)
+    unique_candidates = stable_latest_per_prompt(membership)
+    output_path = log_path / args.output_file
+
+    cached = pd.DataFrame()
+    if output_path.is_file() and not args.force:
+        cached = pd.read_parquet(output_path)
+    cached_ids = set(cached.get("prompt_id", pd.Series(dtype=str)).astype(str))
+    pending = unique_candidates[
+        ~unique_candidates["prompt_id"].astype(str).isin(cached_ids)
+    ].reset_index(drop=True)
+
+    evaluated = pd.DataFrame()
+    if not pending.empty:
+        seed_everything(seed)
+        dataset_config = apply_v3_dataset_profile(ALL_DATASETS[dataset])
+        model_config = ALL_MODELS[model]
+        llm = create_llm(model_config=model_config, seed=seed)
+        set_generation_limit(llm, args.max_output_tokens)
+        test_task = create_test_task(
+            dataset_config=dataset_config,
+            eval_strategy="full",
+            n_subsamples=0,
+            test_size=SETUP.test_size,
+            seed=seed,
+            manifest_dir=args.manifest_dir,
+            regenerate_manifest=False,
+        )
+        prompts = reconstruct_prompts(pending)
+        predictor = MarkerBasedPredictor(llm, test_task.classes)
+        result = test_task.evaluate(
+            prompts=prompts,
+            predictor=predictor,
+            eval_strategy="full",
+        )
+
+        evaluated = pending[["prompt_id"]].reset_index(drop=True).copy()
+        quality = np.asarray(result.agg_scores, dtype=float)
+        input_tokens = np.asarray(result.agg_input_tokens, dtype=float)
+        output_tokens = np.asarray(result.agg_output_tokens, dtype=float)
+        evaluated["test_quality"] = quality
+        evaluated["test_cost"] = (
+            float(model_config.input_costs) * input_tokens
+            + float(model_config.output_costs) * output_tokens
+        )
+        evaluated["test_input_tokens"] = input_tokens
+        evaluated["test_output_tokens"] = output_tokens
+        evaluated["test_fairness"] = np.asarray(result.fairness_loss, dtype=float)
+        evaluated["test_fairness_ready"] = np.asarray(
+            result.fairness_ready, dtype=bool
+        )
+        evaluated["test_fairness_diagnostics_json"] = [
+            json.dumps(value, sort_keys=True, default=str)
+            for value in result.fairness_diagnostics
+        ]
+        evaluated["test_group_support_json"] = [
+            json.dumps(value, sort_keys=True, default=str)
+            for value in result.fairness_support
+        ]
+        evaluated["test_objective_vector"] = [
+            [float(q), -float(c), -float(f)]
+            for q, c, f in zip(
+                evaluated["test_quality"],
+                evaluated["test_cost"],
+                evaluated["test_fairness"],
+            )
+        ]
+        evaluated["evaluation_timestamp"] = utc_now_iso()
+        evaluated["manifest_path"] = str(getattr(test_task, "manifest_path", ""))
+        evaluated["manifest_sha256"] = sha256_file(
+            evaluated["manifest_path"].iloc[0]
+        )
+
+    lookup_parts: list[pd.DataFrame] = []
+    if not cached.empty:
+        columns = _test_columns(cached)
+        lookup_parts.append(stable_latest_per_prompt(cached[columns]))
+    if not evaluated.empty:
+        lookup_parts.append(evaluated)
+    if not lookup_parts:
+        raise RuntimeError("No cached or newly evaluated holdout records are available")
+    lookup = stable_latest_per_prompt(
+        pd.concat(lookup_parts, ignore_index=True, sort=False)
+    )
+
+    test_only = [column for column in lookup.columns if column != "prompt_id"]
+    output = membership.merge(
+        lookup[["prompt_id", *test_only]],
+        on="prompt_id",
+        how="left",
+        validate="many_to_one",
+    )
+    missing_test = output["test_quality"].isna().sum()
+    if missing_test:
+        raise RuntimeError(f"{missing_test} checkpoint rows lack holdout evaluation")
+
+    if not args.force and not cached.empty:
+        output = pd.concat([cached, output], ignore_index=True, sort=False)
+    dedup = ["prompt_id", "chosen_step", "budget_checkpoint"]
+    output = (
+        output.sort_values(dedup, kind="stable")
+        .drop_duplicates(dedup, keep="last")
+        .reset_index(drop=True)
+    )
+    atomic_write_parquet(output, output_path)
+    LOGGER.info(
+        "Wrote %d checkpoint rows covering %d unique prompts to %s",
+        len(output),
+        output["prompt_id"].nunique(),
+        output_path,
+    )
+    return output_path
+
+
+def main() -> None:
+    args = parse_args()
+    configure_logging(args.log_level)
+    run(args)
+
+
+if __name__ == "__main__":
+    main()
