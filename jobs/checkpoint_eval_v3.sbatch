@@ -35,6 +35,12 @@ CHECKPOINTS="${CHECKPOINTS:-2000000,3000000,4000000,5000000}"
 MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v3}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 
+CHECKPOINT_POLICY="${CHECKPOINT_POLICY:-nearest}"
+MAX_CHECKPOINT_RELATIVE_ERROR="${MAX_CHECKPOINT_RELATIVE_ERROR:-0.12}"
+MIN_CHECKPOINT_UTILIZATION="${MIN_CHECKPOINT_UTILIZATION:-0.90}"
+CHECKPOINT_REPLACE_OUTPUT="${CHECKPOINT_REPLACE_OUTPUT:-1}"
+CHECKPOINT_FORCE="${CHECKPOINT_FORCE:-0}"
+
 declare -a models datasets optimizers seeds
 tf_split_csv "$TF_MODELS" models
 tf_split_csv "$TF_DATASETS" datasets
@@ -43,6 +49,7 @@ tf_split_csv "$TF_SEEDS" seeds
 n_models=${#models[@]}; n_datasets=${#datasets[@]}; n_optimizers=${#optimizers[@]}; n_seeds=${#seeds[@]}
 total=$((n_models * n_datasets * n_optimizers * n_seeds))
 idx="${SLURM_ARRAY_TASK_ID:-0}"
+((idx < total)) || tf_die "Array task $idx is outside matrix size $total"
 seed_idx=$((idx % n_seeds)); idx=$((idx / n_seeds))
 optimizer_idx=$((idx % n_optimizers)); idx=$((idx / n_optimizers))
 dataset_idx=$((idx % n_datasets)); idx=$((idx / n_datasets))
@@ -56,6 +63,14 @@ logging_dir="$(tf_read_logging_dir "$output_dir")" || tf_die "Missing run $outpu
 
 declare -a PYTHON_CMD
 tf_python_command PYTHON_CMD
+
+replace_args=()
+tf_is_true "$CHECKPOINT_REPLACE_OUTPUT" && replace_args+=(--replace-output)
+
+force_args=()
+tf_is_true "$CHECKPOINT_FORCE" && force_args+=(--force)
+
+tf_log "Checkpoint evaluation model=$model dataset=$dataset optimizer=$optimizer seed=$seed policy=$CHECKPOINT_POLICY max_relative_error=$MAX_CHECKPOINT_RELATIVE_ERROR"
 "${PYTHON_CMD[@]}" scripts/evaluate_checkpoint_fronts.py \
   --log-path "$logging_dir" \
   --dataset "$dataset" \
@@ -63,5 +78,10 @@ tf_python_command PYTHON_CMD
   --random-seed "$seed" \
   --checkpoints "$CHECKPOINTS" \
   --selection current_incumbents \
+  --checkpoint-policy "$CHECKPOINT_POLICY" \
+  --maximum-checkpoint-relative-error "$MAX_CHECKPOINT_RELATIVE_ERROR" \
+  --minimum-checkpoint-utilization "$MIN_CHECKPOINT_UTILIZATION" \
   --manifest-dir "$MANIFEST_DIR" \
-  --max-output-tokens "$MAX_OUTPUT_TOKENS"
+  --max-output-tokens "$MAX_OUTPUT_TOKENS" \
+  "${replace_args[@]}" \
+  "${force_args[@]}"

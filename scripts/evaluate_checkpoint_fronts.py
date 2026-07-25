@@ -3,7 +3,7 @@
 The optimizer is never given holdout feedback.  After a run is complete, this
 script maps token checkpoints to logged steps, selects candidates using only
 development history, evaluates each unique prompt once on holdout data, and
-writes a checkpoint-aware parquet table for exact nR2/HV/gap analysis.
+writes a checkpoint-aware parquet table for holdout nR2/HV/gap analysis.\nNominal checkpoints may use the nearest real logged state within a frozen\nsymmetric token tolerance; no interpolation or synthetic state is introduced.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -54,7 +55,44 @@ def parse_args() -> argparse.Namespace:
         choices=("current", "current_incumbents", "incumbents", "current_and_incumbents"),
         default="current_incumbents",
     )
-    parser.add_argument("--minimum-checkpoint-utilization", type=float, default=0.90)
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=("nearest", "prior"),
+        default="nearest",
+        help=(
+            "Map each nominal token checkpoint to either the nearest completed logged "
+            "step (symmetric tolerance) or the latest completed step at/below the target."
+        ),
+    )
+    parser.add_argument(
+        "--maximum-checkpoint-relative-error",
+        type=float,
+        default=0.12,
+        help=(
+            "Maximum |actual-target|/target accepted by the nearest policy. "
+            "The main v3 protocol uses 0.12."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-checkpoint-utilization",
+        type=float,
+        default=0.90,
+        help="Minimum actual/target ratio used only by the legacy prior policy.",
+    )
+    parser.add_argument(
+        "--replace-output",
+        action="store_true",
+        help=(
+            "Rebuild checkpoint membership instead of appending old checkpoint rows. "
+            "Cached prompt-level holdout evaluations are still reused."
+        ),
+    )
+    parser.add_argument(
+        "--backup-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Back up an existing output before --replace-output overwrites it.",
+    )
     parser.add_argument("--manifest-dir", default="data/splits_v3")
     parser.add_argument("--max-output-tokens", type=int, default=16)
     parser.add_argument("--output-file", default="eval_checkpoints.parquet")
@@ -124,30 +162,117 @@ def _step_token_table(frame: pd.DataFrame) -> pd.Series:
 def _checkpoint_steps(
     frame: pd.DataFrame,
     checkpoints: list[int],
+    *,
+    policy: str,
+    maximum_relative_error: float,
     minimum_utilization: float,
-) -> list[tuple[int, int, int]]:
+) -> list[tuple[int, int, int, int, float, str]]:
+    """Map nominal token checkpoints to real completed optimization steps.
+
+    ``nearest`` is the v3 publication protocol.  It chooses the completed logged
+    step with the smallest absolute token difference, prefers an under-target
+    step when two candidates are equally distant, and requires a symmetric
+    relative error no larger than ``maximum_relative_error``.
+
+    ``prior`` preserves the former one-sided rule for audit/reproduction.
+    """
+
+    if not 0.0 <= maximum_relative_error <= 1.0:
+        raise ValueError(
+            "--maximum-checkpoint-relative-error must lie in [0, 1]"
+        )
     if not 0.0 < minimum_utilization <= 1.0:
         raise ValueError("--minimum-checkpoint-utilization must lie in (0, 1]")
+
     per_step = _step_token_table(frame)
-    rows: list[tuple[int, int, int]] = []
-    seen: set[tuple[int, int]] = set()
+    if per_step.empty:
+        raise RuntimeError("step_results.parquet contains no usable token counts")
+
+    candidates = pd.DataFrame(
+        {
+            "step": per_step.index.to_numpy(dtype=int),
+            "actual_tokens": per_step.to_numpy(dtype=int),
+        }
+    )
+
+    rows: list[tuple[int, int, int, int, float, str]] = []
     for checkpoint in checkpoints:
-        eligible = per_step[per_step <= checkpoint]
-        if eligible.empty:
-            continue
-        chosen_step = int(eligible.index[-1])
-        actual = int(eligible.iloc[-1])
-        if actual < minimum_utilization * checkpoint:
-            LOGGER.warning(
-                "Skipping checkpoint %d: latest completed step has only %d tokens",
-                checkpoint,
-                actual,
+        if policy == "nearest":
+            ranked = candidates.copy()
+            ranked["signed_error"] = ranked["actual_tokens"] - int(checkpoint)
+            ranked["absolute_error"] = ranked["signed_error"].abs()
+            ranked["relative_error"] = (
+                ranked["absolute_error"] / float(checkpoint)
             )
-            continue
-        key = (checkpoint, chosen_step)
-        if key not in seen:
-            rows.append((checkpoint, chosen_step, actual))
-            seen.add(key)
+            # Prefer the smaller absolute error.  On an exact tie, prefer the
+            # under-target state, then the later logged step.
+            ranked["overshoot"] = (ranked["signed_error"] > 0).astype(int)
+            ranked = ranked.sort_values(
+                ["absolute_error", "overshoot", "step"],
+                ascending=[True, True, False],
+                kind="stable",
+            )
+            chosen = ranked.iloc[0]
+            chosen_step = int(chosen["step"])
+            actual = int(chosen["actual_tokens"])
+            signed_error = int(chosen["signed_error"])
+            relative_error = float(chosen["relative_error"])
+            if relative_error > maximum_relative_error:
+                LOGGER.warning(
+                    "Skipping nominal checkpoint %d: nearest completed step %d "
+                    "has %d tokens (relative error %.4f > %.4f)",
+                    checkpoint,
+                    chosen_step,
+                    actual,
+                    relative_error,
+                    maximum_relative_error,
+                )
+                continue
+            resolved_policy = "nearest_logged_step"
+        elif policy == "prior":
+            eligible = per_step[per_step <= checkpoint]
+            if eligible.empty:
+                LOGGER.warning(
+                    "Skipping checkpoint %d: no completed step exists at/below target",
+                    checkpoint,
+                )
+                continue
+            chosen_step = int(eligible.index[-1])
+            actual = int(eligible.iloc[-1])
+            if actual < minimum_utilization * checkpoint:
+                LOGGER.warning(
+                    "Skipping checkpoint %d: latest completed step has only %d tokens",
+                    checkpoint,
+                    actual,
+                )
+                continue
+            signed_error = int(actual - checkpoint)
+            relative_error = float(abs(signed_error) / checkpoint)
+            resolved_policy = "latest_prior_step"
+        else:  # guarded by argparse; retained for direct function callers
+            raise ValueError(f"Unsupported checkpoint policy: {policy}")
+
+        LOGGER.info(
+            "Nominal checkpoint %d -> step %d at %d tokens "
+            "(signed error %+d, relative error %.4f, policy=%s)",
+            checkpoint,
+            chosen_step,
+            actual,
+            signed_error,
+            relative_error,
+            resolved_policy,
+        )
+        rows.append(
+            (
+                int(checkpoint),
+                chosen_step,
+                actual,
+                signed_error,
+                relative_error,
+                resolved_policy,
+            )
+        )
+
     if not rows:
         raise RuntimeError("No logged step satisfies the requested checkpoint rules")
     return rows
@@ -181,11 +306,20 @@ def run(args: argparse.Namespace) -> Path:
     checkpoint_rows = _checkpoint_steps(
         step_frame,
         _positive_csv(args.checkpoints),
-        float(args.minimum_checkpoint_utilization),
+        policy=str(args.checkpoint_policy),
+        maximum_relative_error=float(args.maximum_checkpoint_relative_error),
+        minimum_utilization=float(args.minimum_checkpoint_utilization),
     )
 
     membership_frames: list[pd.DataFrame] = []
-    for checkpoint, chosen_step, actual_tokens in checkpoint_rows:
+    for (
+        checkpoint,
+        chosen_step,
+        actual_tokens,
+        signed_error,
+        relative_error,
+        checkpoint_policy,
+    ) in checkpoint_rows:
         loader_selection = (
             "current" if args.selection == "current_incumbents" else args.selection
         )
@@ -211,6 +345,9 @@ def run(args: argparse.Namespace) -> Path:
         selected = _rename_development_columns(selected)
         selected["budget_checkpoint"] = int(checkpoint)
         selected["actual_budget_tokens"] = int(actual_tokens)
+        selected["checkpoint_signed_error"] = int(signed_error)
+        selected["checkpoint_relative_error"] = float(relative_error)
+        selected["checkpoint_policy"] = str(checkpoint_policy)
         selected["chosen_step"] = int(resolved_step)
         selected["model"] = model
         selected["dataset"] = dataset
@@ -320,7 +457,7 @@ def run(args: argparse.Namespace) -> Path:
     if missing_test:
         raise RuntimeError(f"{missing_test} checkpoint rows lack holdout evaluation")
 
-    if not args.force and not cached.empty:
+    if not args.replace_output and not args.force and not cached.empty:
         output = pd.concat([cached, output], ignore_index=True, sort=False)
     dedup = ["prompt_id", "chosen_step", "budget_checkpoint"]
     output = (
@@ -328,6 +465,18 @@ def run(args: argparse.Namespace) -> Path:
         .drop_duplicates(dedup, keep="last")
         .reset_index(drop=True)
     )
+    if (
+        args.replace_output
+        and args.backup_existing
+        and output_path.is_file()
+    ):
+        backup_path = output_path.with_name(
+            f"{output_path.stem}_prior_policy_backup{output_path.suffix}"
+        )
+        if not backup_path.exists():
+            shutil.copy2(output_path, backup_path)
+            LOGGER.info("Backed up previous checkpoint table to %s", backup_path)
+
     atomic_write_parquet(output, output_path)
     LOGGER.info(
         "Wrote %d checkpoint rows covering %d unique prompts to %s",

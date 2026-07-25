@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Submit exact post-hoc holdout evaluation for all logged v3 token checkpoints.
+# Submit post-hoc holdout evaluation for all logged v3 token checkpoints.
 
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,6 +16,20 @@ export MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v3}"
 export MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 export MAX_CONCURRENT="${MAX_CONCURRENT:-2}"
 export NODELIST="${NODELIST:-firefly1,firefly2,firefly3}"
+
+# Frozen v3 post-hoc checkpoint-mapping protocol.
+export CHECKPOINT_POLICY="${CHECKPOINT_POLICY:-nearest}"
+export MAX_CHECKPOINT_RELATIVE_ERROR="${MAX_CHECKPOINT_RELATIVE_ERROR:-0.12}"
+export MIN_CHECKPOINT_UTILIZATION="${MIN_CHECKPOINT_UTILIZATION:-0.90}"
+# Replace old checkpoint membership while reusing cached prompt-level holdout values.
+export CHECKPOINT_REPLACE_OUTPUT="${CHECKPOINT_REPLACE_OUTPUT:-1}"
+# Set to 1 only when every prompt must be evaluated again.
+export CHECKPOINT_FORCE="${CHECKPOINT_FORCE:-0}"
+
+case "$CHECKPOINT_POLICY" in
+  nearest|prior) ;;
+  *) tf_die "CHECKPOINT_POLICY must be nearest or prior; got '$CHECKPOINT_POLICY'" ;;
+esac
 
 for model in ${TF_MODELS//,/ }; do
   if [[ "$model" == "gpt-oss-120b" ]] && ((MAX_OUTPUT_TOKENS < 96)); then
@@ -40,5 +54,7 @@ SBATCH_ARGS=(--parsable "--array=$array_spec")
 [[ -n "${MEMORY:-}" ]] && SBATCH_ARGS+=("--mem=$MEMORY")
 [[ -n "${CPUS_PER_TASK:-}" ]] && SBATCH_ARGS+=("--cpus-per-task=$CPUS_PER_TASK")
 [[ -n "${NODELIST:-}" ]] && SBATCH_ARGS+=("--nodelist=$NODELIST")
+
+tf_log "Checkpoint protocol: policy=$CHECKPOINT_POLICY max_relative_error=$MAX_CHECKPOINT_RELATIVE_ERROR replace_output=$CHECKPOINT_REPLACE_OUTPUT force=$CHECKPOINT_FORCE"
 job_id="$(sbatch "${SBATCH_ARGS[@]}" jobs/checkpoint_eval_v3.sbatch)"
 tf_log "Submitted v3 checkpoint holdout array $job_id ($array_spec)"
