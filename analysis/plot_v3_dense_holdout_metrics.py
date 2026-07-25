@@ -1,18 +1,24 @@
-"""Plot dense post-hoc holdout trajectories in a MO-CAPO-style layout.
+"""Plot MO-CAPO-style post-hoc holdout trajectories on actual token usage.
 
-The input is v3_checkpoint_run_metrics.csv produced after evaluating a dense
-nominal checkpoint grid (for example, 2.00M, 2.25M, ..., 5.00M).  Every plotted
-value is computed from a real development-selected logged state evaluated on the
-fixed holdout set.  No objective interpolation or synthetic result is used.
+Input is ``v3_checkpoint_run_metrics.csv`` produced by
+``analysis/summarize_v3_checkpoints.py``.
 
-The evaluator may map adjacent nominal checkpoints to the same logged step.  In
-that case the right-continuous staircase correctly displays a plateau.
+Each seed is first reduced to its unique real evaluated optimizer states using
+``actual_budget_tokens``/``chosen_step``.  The three seed trajectories are then
+placed on the union of their real token positions with a right-continuous
+last-observation-carried-forward rule.  Mean and sample standard deviation are
+computed at each event position.
+
+This is an anytime-trajectory visualization of real holdout evaluations:
+no objective interpolation, smoothing, invented checkpoint, or synthetic metric
+value is introduced.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import NamedTuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,26 +48,30 @@ MODEL_LABELS = {
 }
 
 SPECS = (
-    ("noisy_r2_3d", "Holdout nR2 ↓", "nR2 ↓", "dense_holdout_nr2"),
+    ("noisy_r2_3d", "nR2 Indicator ↓", "actual_token_holdout_nr2"),
     (
         "hv_test_optimistic_3d",
         "Optimistic Holdout Hypervolume ↑",
-        "Optimistic HV ↑",
-        "dense_holdout_hv_optimistic",
+        "actual_token_holdout_hv_optimistic",
     ),
     (
         "hv_test_pessimistic_3d",
         "Pessimistic Holdout Hypervolume ↑",
-        "Pessimistic HV ↑",
-        "dense_holdout_hv_pessimistic",
+        "actual_token_holdout_hv_pessimistic",
     ),
     (
         "approximation_gap_3d",
         "Holdout Approximation Gap ↓",
-        "Approximation Gap ↓",
-        "dense_holdout_gap",
+        "actual_token_holdout_gap",
     ),
 )
+
+
+class CurveStats(NamedTuple):
+    tokens: np.ndarray
+    mean: np.ndarray
+    std: np.ndarray
+    n: np.ndarray
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,19 +83,27 @@ def parse_args() -> argparse.Namespace:
         "--strict-three-seeds",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Require all method/checkpoint groups to contain exactly three seeds.",
+        help="Require exactly three independent seed trajectories per method.",
     )
     parser.add_argument(
         "--minimum-budget",
         type=int,
         default=None,
-        help="Optional lower nominal checkpoint limit, for example 2000000.",
+        help="Optional lower limit in actual cumulative downstream tokens.",
     )
     parser.add_argument(
         "--maximum-budget",
         type=int,
         default=None,
-        help="Optional upper nominal checkpoint limit, for example 5000000.",
+        help="Optional upper limit in actual cumulative downstream tokens.",
+    )
+    parser.add_argument(
+        "--x-label",
+        default="Token Budget [×10⁶]",
+        help=(
+            "Axis label. 'Token Budget [×10⁶]' matches the MO-CAPO presentation; "
+            "'Cumulative Downstream Tokens [×10⁶]' is the more explicit equivalent."
+        ),
     )
     return parser.parse_args()
 
@@ -96,8 +114,8 @@ def configure_style() -> None:
             "figure.dpi": 120,
             "savefig.dpi": 300,
             "font.size": 10,
-            "axes.titlesize": 11,
-            "axes.labelsize": 10,
+            "axes.titlesize": 12,
+            "axes.labelsize": 11,
             "legend.fontsize": 9,
             "xtick.labelsize": 9,
             "ytick.labelsize": 9,
@@ -107,64 +125,234 @@ def configure_style() -> None:
     )
 
 
-def aggregate(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
-    data = frame.copy()
-    data[metric] = pd.to_numeric(data[metric], errors="coerce")
-    data["budget_checkpoint"] = pd.to_numeric(
-        data["budget_checkpoint"], errors="coerce"
+def _numeric(frame: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    output = frame.copy()
+    for column in columns:
+        if column in output:
+            output[column] = pd.to_numeric(output[column], errors="coerce")
+    return output
+
+
+def _unique_real_states(
+    frame: pd.DataFrame,
+    *,
+    method: str,
+    metric: str,
+    minimum_budget: int | None,
+    maximum_budget: int | None,
+) -> dict[int, pd.DataFrame]:
+    required = {"seed", "actual_budget_tokens", metric}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Run metrics are missing {sorted(missing)}")
+
+    data = frame[frame["optimizer"] == method].copy()
+    data = _numeric(
+        data,
+        (
+            "seed",
+            "budget_checkpoint",
+            "chosen_step",
+            "actual_budget_tokens",
+            metric,
+        ),
     )
-    data["seed"] = pd.to_numeric(data["seed"], errors="coerce")
-    data = data.dropna(subset=[metric, "budget_checkpoint", "seed"])
-    grouped = (
-        data.groupby(["optimizer", "budget_checkpoint"], sort=True)[metric]
-        .agg(["mean", "std", "count"])
-        .reset_index()
-        .rename(columns={"count": "n"})
+    data = data.dropna(subset=["seed", "actual_budget_tokens", metric])
+    data["seed"] = data["seed"].astype(int)
+
+    if minimum_budget is not None:
+        data = data[data["actual_budget_tokens"] >= minimum_budget]
+    if maximum_budget is not None:
+        data = data[data["actual_budget_tokens"] <= maximum_budget]
+
+    result: dict[int, pd.DataFrame] = {}
+    for seed, group in data.groupby("seed", sort=True):
+        order = [
+            column
+            for column in ("actual_budget_tokens", "chosen_step", "budget_checkpoint")
+            if column in group
+        ]
+        group = group.sort_values(order, kind="stable")
+
+        # Several nominal checkpoints may map to the same real logged state.
+        # Keep that state only once.
+        dedup = (
+            ["chosen_step"]
+            if "chosen_step" in group and group["chosen_step"].notna().all()
+            else ["actual_budget_tokens"]
+        )
+        group = group.drop_duplicates(dedup, keep="last")
+        group = group.drop_duplicates(["actual_budget_tokens"], keep="last")
+        group = group.sort_values("actual_budget_tokens", kind="stable")
+
+        if not group.empty:
+            result[int(seed)] = group.reset_index(drop=True)
+
+    return result
+
+
+def _locf_stats(seed_states: dict[int, pd.DataFrame], metric: str) -> CurveStats:
+    if not seed_states:
+        raise RuntimeError(f"No seed states are available for {metric}")
+
+    # Start only when all seeds have at least one real evaluated state.
+    common_start = max(
+        int(group["actual_budget_tokens"].iloc[0])
+        for group in seed_states.values()
     )
-    grouped["std"] = grouped["std"].fillna(0.0)
-    return grouped
+
+    grid = np.unique(
+        np.concatenate(
+            [
+                group["actual_budget_tokens"].to_numpy(dtype=int)
+                for group in seed_states.values()
+            ]
+        )
+    )
+    grid = np.sort(grid[grid >= common_start])
+    if grid.size == 0:
+        raise RuntimeError(f"No common actual-token grid is available for {metric}")
+
+    trajectories: list[np.ndarray] = []
+    for group in seed_states.values():
+        x = group["actual_budget_tokens"].to_numpy(dtype=int)
+        y = group[metric].to_numpy(dtype=float)
+
+        values = np.full(grid.size, np.nan, dtype=float)
+        positions = np.searchsorted(x, grid, side="right") - 1
+        valid = positions >= 0
+        values[valid] = y[positions[valid]]
+        trajectories.append(values)
+
+    matrix = np.vstack(trajectories)
+    n = np.sum(np.isfinite(matrix), axis=0)
+    mean = np.nanmean(matrix, axis=0)
+
+    std = np.zeros(grid.size, dtype=float)
+    for index in range(grid.size):
+        values = matrix[:, index]
+        values = values[np.isfinite(values)]
+        std[index] = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+
+    return CurveStats(tokens=grid, mean=mean, std=std, n=n)
 
 
-def save_figure(fig: plt.Figure, outdir: Path, stem: str, output_format: str) -> None:
-    if output_format in {"png", "both"}:
-        fig.savefig(outdir / f"{stem}.png", dpi=300, bbox_inches="tight")
-    if output_format in {"pdf", "both"}:
-        fig.savefig(outdir / f"{stem}.pdf", bbox_inches="tight")
-    plt.close(fig)
+def _initial_stats(frame: pd.DataFrame, metric: str) -> tuple[float, float] | None:
+    data = frame[frame["optimizer"] == "Initial"].copy()
+    if metric not in data:
+        return None
+    values = pd.to_numeric(data[metric], errors="coerce").dropna()
+    if values.empty:
+        return None
+    mean = float(values.mean())
+    std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+    return mean, std
 
 
-def draw_metric(
+def _build_curves(
+    frame: pd.DataFrame,
+    *,
+    metric: str,
+    minimum_budget: int | None,
+    maximum_budget: int | None,
+    strict_three_seeds: bool,
+) -> dict[str, CurveStats]:
+    curves: dict[str, CurveStats] = {}
+    for method in METHOD_ORDER:
+        seed_states = _unique_real_states(
+            frame,
+            method=method,
+            metric=metric,
+            minimum_budget=minimum_budget,
+            maximum_budget=maximum_budget,
+        )
+        if strict_three_seeds and set(seed_states) != {42, 43, 44}:
+            raise RuntimeError(
+                f"{method}/{metric} has seeds {sorted(seed_states)}; "
+                "expected 42, 43, and 44"
+            )
+        curves[method] = _locf_stats(seed_states, metric)
+    return curves
+
+
+def _draw_metric(
     ax: plt.Axes,
     frame: pd.DataFrame,
     *,
     metric: str,
-    title: str,
     ylabel: str,
+    x_label: str,
+    minimum_budget: int | None,
+    maximum_budget: int | None,
     strict_three_seeds: bool,
 ) -> pd.DataFrame:
-    grouped = aggregate(frame, metric)
-    methods = grouped[grouped["optimizer"].isin(METHOD_ORDER)].copy()
-    if methods.empty:
-        raise RuntimeError(f"No method rows available for {metric}")
+    curves = _build_curves(
+        frame,
+        metric=metric,
+        minimum_budget=minimum_budget,
+        maximum_budget=maximum_budget,
+        strict_three_seeds=strict_three_seeds,
+    )
 
-    if strict_three_seeds:
-        bad = methods[methods["n"] != 3]
-        if not bad.empty:
-            details = bad[
-                ["optimizer", "budget_checkpoint", "n"]
-            ].to_string(index=False)
-            raise RuntimeError(
-                f"{metric} does not have three seeds at every checkpoint:\n{details}"
+    xmin = min(float(curve.tokens[0]) for curve in curves.values()) / 1_000_000.0
+    xmax = max(float(curve.tokens[-1]) for curve in curves.values()) / 1_000_000.0
+
+    audit_rows: list[pd.DataFrame] = []
+    method_handles = []
+
+    for method in METHOD_ORDER:
+        curve = curves[method]
+        x = curve.tokens.astype(float) / 1_000_000.0
+
+        (line,) = ax.step(
+            x,
+            curve.mean,
+            where="post",
+            color=COLORS[method],
+            linewidth=2.0,
+            label=DISPLAY[method],
+            zorder=3,
+        )
+        method_handles.append(line)
+
+        # Match the reference style: markers only at the first and final point.
+        ax.scatter(
+            [x[0], x[-1]],
+            [curve.mean[0], curve.mean[-1]],
+            color=COLORS[method],
+            marker=MARKERS[method],
+            s=38,
+            zorder=4,
+        )
+
+        ax.fill_between(
+            x,
+            curve.mean - curve.std,
+            curve.mean + curve.std,
+            step="post",
+            color=COLORS[method],
+            alpha=0.16,
+            zorder=2,
+        )
+
+        audit_rows.append(
+            pd.DataFrame(
+                {
+                    "optimizer": method,
+                    "metric": metric,
+                    "actual_budget_tokens": curve.tokens,
+                    "mean": curve.mean,
+                    "std": curve.std,
+                    "n_seeds": curve.n,
+                }
             )
+        )
 
-    xmin = float(methods["budget_checkpoint"].min()) / 1_000_000.0
-    xmax = float(methods["budget_checkpoint"].max()) / 1_000_000.0
-
-    initial = grouped[grouped["optimizer"] == "Initial"]
-    if not initial.empty:
-        initial_mean = float(initial["mean"].iloc[0])
-        initial_std = float(initial["std"].iloc[0])
-        ax.axhline(
+    initial_handle = None
+    initial = _initial_stats(frame, metric)
+    if initial is not None:
+        initial_mean, initial_std = initial
+        initial_handle = ax.axhline(
             initial_mean,
             color=COLORS["Initial"],
             linestyle="--",
@@ -182,44 +370,27 @@ def draw_metric(
                 zorder=0,
             )
 
-    for method in METHOD_ORDER:
-        data = methods[methods["optimizer"] == method].sort_values(
-            "budget_checkpoint"
-        )
-        if data.empty:
-            continue
-        x = data["budget_checkpoint"].to_numpy(dtype=float) / 1_000_000.0
-        mean = data["mean"].to_numpy(dtype=float)
-        std = data["std"].to_numpy(dtype=float)
-
-        ax.step(
-            x,
-            mean,
-            where="post",
-            color=COLORS[method],
-            marker=MARKERS[method],
-            linewidth=2.0,
-            markersize=4.5,
-            label=DISPLAY[method],
-            zorder=3,
-        )
-        ax.fill_between(
-            x,
-            mean - std,
-            mean + std,
-            step="post",
-            color=COLORS[method],
-            alpha=0.16,
-            zorder=2,
-        )
-
-    padding = max(0.03, (xmax - xmin) * 0.02)
+    padding = max(0.03, 0.02 * (xmax - xmin))
     ax.set_xlim(xmin - padding, xmax + padding)
-    ax.set_title(title)
-    ax.set_xlabel("Nominal Downstream Token Checkpoint [×10⁶]")
+    ax.set_xlabel(x_label)
     ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25)
-    return grouped
+    ax.grid(True, alpha=0.22, linestyle="--", linewidth=0.7)
+
+    handles = method_handles + ([initial_handle] if initial_handle is not None else [])
+    labels = [DISPLAY[method] for method in METHOD_ORDER]
+    if initial_handle is not None:
+        labels.append(DISPLAY["Initial"])
+    ax.legend(handles, labels, frameon=False)
+
+    return pd.concat(audit_rows, ignore_index=True)
+
+
+def save_figure(fig: plt.Figure, outdir: Path, stem: str, output_format: str) -> None:
+    if output_format in {"png", "both"}:
+        fig.savefig(outdir / f"{stem}.png", dpi=300, bbox_inches="tight")
+    if output_format in {"pdf", "both"}:
+        fig.savefig(outdir / f"{stem}.pdf", bbox_inches="tight")
+    plt.close(fig)
 
 
 def main() -> None:
@@ -237,20 +408,11 @@ def main() -> None:
         "optimizer",
         "seed",
         "budget_checkpoint",
+        "actual_budget_tokens",
     }
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"Run-metric table is missing {sorted(missing)}")
-
-    checkpoint = pd.to_numeric(frame["budget_checkpoint"], errors="coerce")
-    methods_mask = frame["optimizer"].isin(METHOD_ORDER)
-    keep = (~methods_mask) | (checkpoint > 0)
-
-    if args.minimum_budget is not None:
-        keep &= (~methods_mask) | (checkpoint >= args.minimum_budget)
-    if args.maximum_budget is not None:
-        keep &= (~methods_mask) | (checkpoint <= args.maximum_budget)
-    frame = frame[keep].copy()
 
     output_root = Path(args.output_dir).expanduser().resolve()
 
@@ -263,85 +425,92 @@ def main() -> None:
             f"{MODEL_LABELS.get(str(model), model)}"
         )
 
-        aggregate_tables: list[pd.DataFrame] = []
+        audit_tables: list[pd.DataFrame] = []
 
-        for metric, title, ylabel, stem in SPECS:
+        for metric, ylabel, stem in SPECS:
             if metric not in group:
                 continue
             fig, ax = plt.subplots(figsize=(6.8, 4.4), constrained_layout=True)
-            table = draw_metric(
+            audit = _draw_metric(
                 ax,
                 group,
                 metric=metric,
-                title=f"{heading}: {title}",
                 ylabel=ylabel,
+                x_label=args.x_label,
+                minimum_budget=args.minimum_budget,
+                maximum_budget=args.maximum_budget,
                 strict_three_seeds=args.strict_three_seeds,
             )
-            ax.legend(frameon=False)
-            ax.text(
-                0.01,
-                0.01,
-                "Post-hoc holdout; nearest real logged states (≤12% token deviation).",
-                transform=ax.transAxes,
-                ha="left",
-                va="bottom",
-                fontsize=7,
-                alpha=0.72,
-            )
+            ax.set_title(heading)
             save_figure(fig, outdir, stem, args.format)
-            aggregate_tables.append(table.assign(metric=metric))
+            audit_tables.append(audit)
 
         fig, axes = plt.subplots(2, 2, figsize=(11.2, 7.8), constrained_layout=True)
-        for ax, (metric, title, ylabel, _) in zip(axes.ravel(), SPECS):
+        for ax, (metric, ylabel, _) in zip(axes.ravel(), SPECS):
             if metric not in group:
                 ax.set_axis_off()
                 continue
-            draw_metric(
+            _draw_metric(
                 ax,
                 group,
                 metric=metric,
-                title=title,
                 ylabel=ylabel,
+                x_label=args.x_label,
+                minimum_budget=args.minimum_budget,
+                maximum_budget=args.maximum_budget,
                 strict_three_seeds=args.strict_three_seeds,
             )
+            ax.set_title(ylabel)
 
+        # One shared legend, matching Tri-Fair / NSGA-II / Initial order.
+        for ax in axes.ravel():
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.remove()
         handles, labels = axes[0, 0].get_legend_handles_labels()
         if handles:
+            order = [
+                labels.index(DISPLAY[name])
+                for name in (*METHOD_ORDER, "Initial")
+                if DISPLAY[name] in labels
+            ]
             fig.legend(
-                handles,
-                labels,
+                [handles[index] for index in order],
+                [labels[index] for index in order],
                 loc="upper center",
                 ncol=3,
                 frameon=False,
                 bbox_to_anchor=(0.5, 1.02),
             )
+
         fig.suptitle(
-            f"{heading}: Post-hoc Holdout Trajectories",
+            f"{heading}: Post-hoc Holdout Anytime Trajectories",
             y=1.055,
             fontsize=14,
         )
         fig.text(
             0.5,
             -0.01,
-            "Nearest real logged state at each nominal checkpoint; "
-            "lines and bands show mean ± standard deviation across three seeds.",
+            "Right-continuous latest real holdout state; "
+            "lines and shaded regions show mean ± standard deviation "
+            "across three independent seeds.",
             ha="center",
             fontsize=8,
         )
         save_figure(
             fig,
             outdir,
-            "dense_holdout_nr2_hv_gap_2x2",
+            "actual_token_holdout_nr2_hv_gap_2x2",
             args.format,
         )
 
-        if aggregate_tables:
-            pd.concat(aggregate_tables, ignore_index=True).to_csv(
-                outdir / "dense_holdout_aggregate_mean_std.csv",
+        if audit_tables:
+            pd.concat(audit_tables, ignore_index=True).to_csv(
+                outdir / "actual_token_holdout_mean_std.csv",
                 index=False,
             )
 
-        print(f"Wrote dense holdout figures to {outdir}")
+        print(f"Wrote actual-token holdout trajectories to {outdir}")
 
 
 if __name__ == "__main__":
