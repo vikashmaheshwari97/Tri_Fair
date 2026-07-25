@@ -1,8 +1,7 @@
 """Construct configured vLLM-backed Promptolution language models.
 
-Torch is imported only when a model is actually created. Consequently,
-configuration inspection and ``--help`` commands work on CPU-only Windows
-machines, while real inference still requires Linux, CUDA, PyTorch and vLLM.
+Configuration inspection remains CPU-safe. Real model execution requires Linux,
+CUDA, PyTorch, vLLM, and a complete local model snapshot when Rocket is offline.
 """
 
 from __future__ import annotations
@@ -10,13 +9,14 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from promptolution.llms import VLLM
 
 from src.config.base_config import ModelConfig
 
 GPT_OSS_ALIAS = "gpt-oss-120b"
+QWEN_ALIAS = "qwen-3-30b"
 GPT_OSS_REQUIRED_SHARDS = 15
 GPT_OSS_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 
@@ -44,20 +44,12 @@ class GPTOSSVLLM(VLLM):
         prompts: list[str],
         system_prompts: list[str],
     ) -> list[str]:
-        """Render GPT-OSS prompts with an explicit reasoning effort."""
-
         rendered_prompts = [
             str(
                 self.tokenizer.apply_chat_template(
                     [
-                        {
-                            "role": "system",
-                            "content": system_prompt,
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
                     ],
                     tokenize=False,
                     add_generation_prompt=True,
@@ -80,9 +72,8 @@ def _load_torch():
         return importlib.import_module("torch")
     except (ImportError, OSError) as error:
         raise RuntimeError(
-            "PyTorch could not be imported. Tri-Fair model execution requires a working "
-            "PyTorch/CUDA installation and is intended for the Linux GPU cluster. "
-            "Metric tests and CLI --help do not require torch."
+            "PyTorch could not be imported. Tri-Fair model execution requires a "
+            "working PyTorch/CUDA installation on the Linux GPU cluster."
         ) from error
 
 
@@ -94,6 +85,111 @@ def get_available_gpu_memory_gb(device_index: int = 0) -> float:
     return float(properties.total_memory) / (1024**3)
 
 
+def _resolved_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
+
+
+def _snapshot_is_complete(
+    snapshot: Path,
+    *,
+    required_shards: int | None = None,
+) -> tuple[bool, str]:
+    if not snapshot.is_dir():
+        return False, "not a directory"
+
+    required = ("config.json",)
+    missing = [name for name in required if not (snapshot / name).is_file()]
+    if missing:
+        return False, f"missing {missing}"
+
+    tokenizer_present = any(
+        (snapshot / name).is_file()
+        for name in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model")
+    )
+    if not tokenizer_present:
+        return False, "missing tokenizer files"
+
+    index_present = (snapshot / "model.safetensors.index.json").is_file()
+    shards = sorted(snapshot.glob("model-*.safetensors"))
+    single_weights = sorted(snapshot.glob("*.safetensors"))
+    if not index_present and not shards and not single_weights:
+        return False, "missing safetensor weights"
+
+    if required_shards is not None and len(shards) != int(required_shards):
+        return (
+            False,
+            f"expected {required_shards} model shards, found {len(shards)}",
+        )
+    return True, "ok"
+
+
+def _unique_paths(values: Iterable[str | Path | None]) -> list[Path]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None or not str(value).strip():
+            continue
+        path = _resolved_path(str(value))
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def _cache_roots(model_config: ModelConfig) -> list[Path]:
+    return _unique_paths(
+        (
+            os.environ.get("HF_HUB_CACHE"),
+            os.environ.get("HUGGINGFACE_HUB_CACHE"),
+            model_config.model_storage_path,
+            Path.home() / ".cache/huggingface/hub",
+        )
+    )
+
+
+def _resolve_qwen_snapshot(
+    model_config: ModelConfig,
+    *,
+    model_name: str,
+    revision: str | None,
+) -> Path:
+    explicit = os.environ.get("QWEN_LOCAL_SNAPSHOT", "").strip()
+    repo_cache_name = "models--" + model_name.replace("/", "--")
+
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(_resolved_path(explicit))
+
+    for root in _cache_roots(model_config):
+        candidates.append(root)
+        if revision:
+            candidates.extend(
+                (
+                    root / repo_cache_name / "snapshots" / revision,
+                    root / "snapshots" / revision,
+                    root / revision,
+                )
+            )
+
+    checked: list[str] = []
+    for candidate in _unique_paths(candidates):
+        complete, reason = _snapshot_is_complete(candidate)
+        checked.append(f"{candidate} ({reason})")
+        if complete:
+            return candidate
+
+    details = "\n  - ".join(checked) if checked else "no candidate paths"
+    raise FileNotFoundError(
+        "Qwen-3-30B local snapshot could not be resolved while Rocket is "
+        "offline. Set QWEN_LOCAL_SNAPSHOT to the complete snapshot directory. "
+        f"Checked:\n  - {details}"
+    )
+
+
 def _resolve_gpt_oss_snapshot() -> Path:
     raw = os.environ.get("GPT_OSS_LOCAL_SNAPSHOT", "").strip()
     if not raw:
@@ -102,29 +198,13 @@ def _resolve_gpt_oss_snapshot() -> Path:
             "snapshot directory"
         )
 
-    snapshot = Path(raw).expanduser().resolve()
-    if not snapshot.is_dir():
-        raise FileNotFoundError(
-            f"GPT_OSS_LOCAL_SNAPSHOT is not a directory: {snapshot}"
-        )
-
-    required_files = (
-        "config.json",
-        "tokenizer.json",
-        "model.safetensors.index.json",
+    snapshot = _resolved_path(raw)
+    complete, reason = _snapshot_is_complete(
+        snapshot,
+        required_shards=GPT_OSS_REQUIRED_SHARDS,
     )
-    missing = [name for name in required_files if not (snapshot / name).is_file()]
-    if missing:
-        raise RuntimeError(
-            f"GPT-OSS local snapshot is missing required files: {missing}"
-        )
-
-    shards = sorted(snapshot.glob("model-*.safetensors"))
-    if len(shards) != GPT_OSS_REQUIRED_SHARDS:
-        raise RuntimeError(
-            "GPT-OSS local snapshot must contain exactly "
-            f"{GPT_OSS_REQUIRED_SHARDS} root safetensor shards; found {len(shards)}"
-        )
+    if not complete:
+        raise RuntimeError(f"Invalid GPT-OSS local snapshot {snapshot}: {reason}")
     return snapshot
 
 
@@ -151,9 +231,21 @@ def create_llm(model_config: ModelConfig, seed: int) -> VLLM:
 
     wrapper_type: type[VLLM] = VLLM
     wrapper_kwargs: dict[str, Any] = {}
-    if model_config.alias == GPT_OSS_ALIAS:
+
+    if model_config.alias == QWEN_ALIAS:
+        revision = llm_kwargs.get("revision")
+        model_name = str(
+            _resolve_qwen_snapshot(
+                model_config,
+                model_name=model_name,
+                revision=str(revision) if revision is not None else None,
+            )
+        )
+        # An absolute local snapshot must not be resolved through Hugging Face.
+        llm_kwargs.pop("revision", None)
+
+    elif model_config.alias == GPT_OSS_ALIAS:
         model_name = str(_resolve_gpt_oss_snapshot())
-        # A local snapshot has no Hugging Face revision to resolve.
         llm_kwargs.pop("revision", None)
         wrapper_type = GPTOSSVLLM
         wrapper_kwargs["reasoning_effort"] = "low"

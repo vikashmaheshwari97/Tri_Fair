@@ -24,6 +24,8 @@ cd "$ROOT"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck source=jobs/lib/common.sh
 source jobs/lib/common.sh
+# shellcheck source=jobs/lib/model_cache_v3.sh
+source jobs/lib/model_cache_v3.sh
 
 TF_MODELS="${TF_MODELS:-qwen-3-30b}"
 TF_DATASETS="${TF_DATASETS:-bbq,civil_comments,bias_in_bios}"
@@ -74,6 +76,8 @@ model="${models[$model_idx]}"
 dataset="${datasets[$dataset_idx]}"
 optimizer="${optimizers[$optimizer_idx]}"
 seed="${seeds[$seed_idx]}"
+
+tf_configure_v3_model_cache "$model"
 
 tf_contains "$dataset" bbq civil_comments bias_in_bios \
   || tf_die "Unsupported fairness dataset '$dataset'"

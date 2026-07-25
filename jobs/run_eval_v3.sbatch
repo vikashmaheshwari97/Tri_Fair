@@ -25,11 +25,15 @@ if (($# != 5)); then
 fi
 model="$1"; dataset="$2"; optimizer="$3"; seed="$4"; budget="$5"
 
+tf_configure_v3_model_cache "$model"
+
 ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$ROOT"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck source=jobs/lib/common.sh
 source jobs/lib/common.sh
+# shellcheck source=jobs/lib/model_cache_v3.sh
+source jobs/lib/model_cache_v3.sh
 
 MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v3}"
 TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v3_qwen_5m}"

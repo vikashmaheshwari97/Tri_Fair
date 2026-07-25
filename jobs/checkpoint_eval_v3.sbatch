@@ -23,6 +23,8 @@ ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$ROOT"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 source jobs/lib/common.sh
+# shellcheck source=jobs/lib/model_cache_v3.sh
+source jobs/lib/model_cache_v3.sh
 
 TF_MODELS="${TF_MODELS:-qwen-3-30b}"
 TF_DATASETS="${TF_DATASETS:-bbq,civil_comments,bias_in_bios}"
@@ -46,6 +48,8 @@ optimizer_idx=$((idx % n_optimizers)); idx=$((idx / n_optimizers))
 dataset_idx=$((idx % n_datasets)); idx=$((idx / n_datasets))
 model_idx=$((idx % n_models))
 model="${models[$model_idx]}"; dataset="${datasets[$dataset_idx]}"; optimizer="${optimizers[$optimizer_idx]}"; seed="${seeds[$seed_idx]}"
+
+tf_configure_v3_model_cache "$model"
 
 output_dir="$(tf_run_output_dir "$ROOT" "$model" "$dataset" "$optimizer" "$seed")"
 logging_dir="$(tf_read_logging_dir "$output_dir")" || tf_die "Missing run $output_dir"
