@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Resolve complete local model snapshots for Rocket's offline compute nodes.
-# This file is sourced by v3 workers.
+#
+# Important: model snapshots and Hugging Face dataset files may live in
+# different cache roots.  Qwen/GPT-OSS are passed to vLLM by absolute local
+# snapshot path, while hf_hub_download must continue to use the shared dataset
+# cache (normally ~/.cache/huggingface/hub).
 
 tf_configure_v3_model_cache() {
   local model="$1"
@@ -10,6 +14,16 @@ tf_configure_v3_model_cache() {
 
   export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
   export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
+  # Keep dataset downloads in the normal shared Hugging Face cache.  Do not
+  # point HF_HUB_CACHE at a model-specific directory: doing so hides cached
+  # datasets such as heegyu/bbq from hf_hub_download.
+  local shared_hf_home="${TF_HF_HOME:-$HOME/.cache/huggingface}"
+  local shared_hf_hub_cache="${TF_HF_HUB_CACHE:-$shared_hf_home/hub}"
+  export HF_HOME="$shared_hf_home"
+  export HF_HUB_CACHE="$shared_hf_hub_cache"
+  export HUGGINGFACE_HUB_CACHE="$shared_hf_hub_cache"
+  export HF_DATASETS_CACHE="${TF_HF_DATASETS_CACHE:-$shared_hf_home/datasets}"
 
   case "$model" in
     qwen-3-30b)
@@ -26,9 +40,9 @@ tf_configure_v3_model_cache() {
            && { [[ -f "$candidate/model.safetensors.index.json" ]] \
                 || compgen -G "$candidate/*.safetensors" >/dev/null; }; then
           export QWEN_LOCAL_SNAPSHOT="$candidate"
-          export HF_HUB_CACHE="$(dirname "$(dirname "$(dirname "$candidate")")")"
-          export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
           tf_log "Using Qwen local snapshot: $QWEN_LOCAL_SNAPSHOT"
+          tf_log "Using Hugging Face hub cache: $HF_HUB_CACHE"
+          tf_log "Using Hugging Face datasets cache: $HF_DATASETS_CACHE"
           return 0
         fi
       done
@@ -48,6 +62,8 @@ tf_configure_v3_model_cache() {
            && [[ -f "$candidate/model.safetensors.index.json" ]]; then
           export GPT_OSS_LOCAL_SNAPSHOT="$candidate"
           tf_log "Using GPT-OSS local snapshot: $GPT_OSS_LOCAL_SNAPSHOT"
+          tf_log "Using Hugging Face hub cache: $HF_HUB_CACHE"
+          tf_log "Using Hugging Face datasets cache: $HF_DATASETS_CACHE"
           return 0
         fi
       done
