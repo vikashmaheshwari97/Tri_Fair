@@ -1,0 +1,17 @@
+FILE_MANIFEST.txt
+PATCH_BASE.txt
+TRI_FAIR_V5_DEPLOY.md
+TRI_FAIR_V5_PROTOCOL.md
+analysis/summarize_v5_checkpoints.py
+jobs/all_step_holdout_eval_v5.sbatch
+jobs/initial_eval_v5.sbatch
+jobs/submit_all_step_holdout_eval_v5.sh
+jobs/submit_initial_eval_v5.sh
+jobs/submit_tri_fair_v5.sh
+jobs/tri_fair_v5_main.sbatch
+scripts/evaluate_initial_pool_v5.py
+scripts/experiment_v5.py
+src/config/v5_profiles.py
+src/config/v5_seed_pool.py
+src/fairness/v5_variation.py
+src/tri_fair_v5.py

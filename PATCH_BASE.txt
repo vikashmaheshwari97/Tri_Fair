@@ -1,0 +1,6 @@
+Repository: vikashmaheshwari97/Tri_Fair
+Expected base branch: main
+Expected base commit at preparation time: a4d9af9210d502b1caf406b9039c5a279a6d1aee
+Prepared: 2026-07-26
+
+All paths in this archive are new v5 overlay files. Existing v2/v3/v4 files are not overwritten.
