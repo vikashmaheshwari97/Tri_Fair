@@ -879,7 +879,12 @@ def _load_shared_union_final_evaluations(
             f"extra={sorted(observed-expected)}"
         )
 
-    # The same prompt must have one held-out result in the shared-union file.
+    # A prompt must have one held-out result within the same seed/manifest.
+    #
+    # Prompt IDs can legitimately recur across seeds because the prompt text is
+    # identical while each seed uses a different held-out manifest. Therefore,
+    # consistency must be checked per (seed, prompt_id), not globally by
+    # prompt_id across all three seeds.
     metric_columns = [
         "test_quality",
         "test_cost",
@@ -887,11 +892,19 @@ def _load_shared_union_final_evaluations(
         "test_input_tokens",
         "test_output_tokens",
     ]
-    consistency = output.groupby("prompt_id")[metric_columns].nunique(dropna=False)
+    consistency = (
+        output.groupby(
+            ["seed", "prompt_id"],
+            dropna=False,
+        )[metric_columns]
+        .nunique(dropna=False)
+    )
     inconsistent = consistency[(consistency > 1).any(axis=1)]
     if not inconsistent.empty:
+        details = inconsistent.reset_index().to_string(index=False)
         raise RuntimeError(
-            f"{len(inconsistent)} shared prompt IDs have inconsistent held-out results"
+            "Shared-union held-out inconsistency detected within a seed. "
+            f"Affected (seed, prompt_id) groups: {len(inconsistent)}\n{details}"
         )
     return output.reset_index(drop=True)
 
