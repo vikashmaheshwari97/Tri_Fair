@@ -1,4 +1,4 @@
-"""Adaptive, dataset-aware variation for Tri-Fair v6.
+"""Adaptive, dataset-aware variation for Tri-Fair v6 (context hotfix).
 
 The operator uses development data only.  It never reads holdout metrics.
 """
@@ -11,6 +11,7 @@ from promptolution.utils.capo_utils import build_few_shot_examples
 from promptolution.utils.formatting import extract_from_tag
 from promptolution.utils.prompt import Prompt
 
+from src.fairness.objective_mutation import _compact_diagnostics
 from src.fairness.v4_variation import generate_v4_challengers
 from src.fairness.v5_variation import (
     MODE_WORD_LIMIT,
@@ -49,6 +50,27 @@ def _quality_enrichment(
         optimizer=optimizer,
     )
     return _deduplicate_examples([*examples, *list(additions)], upper)
+
+
+def _bounded_diagnostics_text(
+    record: dict[str, Any],
+    *,
+    max_chars: int = 1800,
+) -> str:
+    """Return compact development diagnostics safe for the meta-model context.
+
+    Raw fairness diagnostics can contain per-group tables large enough to exceed
+    Qwen's 3,000-token meta-prompt limit.  V5 already used
+    ``_compact_diagnostics``; v6 must do the same and apply a final character
+    bound as a defensive guard.
+    """
+    diagnostics = dict(record.get("diagnostics") or {})
+    text = " ".join(str(_compact_diagnostics(diagnostics)).split())
+    if len(text) <= max_chars:
+        return text
+
+    clipped = text[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return clipped + " … [diagnostics truncated]"
 
 
 def generate_v6_challengers(optimizer: Any) -> list[Prompt]:
@@ -132,7 +154,7 @@ def generate_v6_challengers(optimizer: Any) -> list[Prompt]:
         .replace("<goal>", goal_for_mode(optimizer, mode))
         .replace(
             "<diagnostics>",
-            str(record.get("diagnostics") or {}),
+            _bounded_diagnostics_text(record),
         )
         for child, mode, record in zip(children, modes, guide_records)
     ]
