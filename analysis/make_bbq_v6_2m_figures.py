@@ -1,10 +1,6 @@
-"""Generate BBQ Tri-Fair-v6 2M smoke-run publication figures.
+"""Generate publication-style BBQ Tri-Fair-v6 2M smoke-run figures.
 
-The script compares:
-
-* Tri-Fair-v6
-* NSGA-II-PO-Fair
-
+The visual design follows the established BBQ 5M figure suite: black Tri-Fair,\norange NSGA-II-PO-Fair, compact single-purpose panels, step trajectories,\ncoverage-valid Pareto fronts, empirical attainment, method comparison bars,\nand Tri-Fair few-shot diagnostics.\n\nThe script compares:\n\n* Tri-Fair-v6\n* NSGA-II-PO-Fair\n
 It uses the completed development histories and all-step held-out evaluations
 from the matched 2M BBQ smoke run.  It does not use balanced operating points.
 
@@ -20,21 +16,21 @@ The corresponding held-out values are then reported for the same prompts.
 Independent held-out archive extremes are generated only as clearly labelled
 diagnostics.
 
-Every figure uses the term ``Accuracy`` rather than ``Test Quality``.
+Every figure labels the BBQ performance metric as ``Accuracy``.
 
 Default Rocket command
 ----------------------
 
-    PYTHONPATH="$PWD" python -m analysis.make_bbq_v6_smoke_2m_figures --strict
+    PYTHONPATH="$PWD" python -m analysis.make_bbq_v6_2m_figures --strict
 
 Explicit command
 ----------------
 
-    PYTHONPATH="$PWD" python -m analysis.make_bbq_v6_smoke_2m_figures \
+    PYTHONPATH="$PWD" python -m analysis.make_bbq_v6_2m_figures \
       --results-root \
         results/tri_fair_v6_smoke_2m_matched1/qwen-3-30b/bbq \
       --output-dir \
-        analysis/output/tri_fair_v6_smoke_2m/publication_figures/bbq \
+        analysis/output/tri_fair_v6_2m/publication_figures/bbq \
       --accuracy-threshold 0.90 \
       --strict
 
@@ -142,20 +138,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def configure_style() -> None:
+    """Match the established BBQ publication-figure visual style."""
     plt.rcParams.update(
         {
-            "figure.dpi": 130,
-            "savefig.dpi": 400,
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
             "font.size": 10,
             "axes.titlesize": 11,
             "axes.labelsize": 10,
-            "legend.fontsize": 8.5,
+            "legend.fontsize": 9,
             "xtick.labelsize": 9,
             "ytick.labelsize": 9,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
         }
     )
 
@@ -815,330 +810,425 @@ def save_figure(
     plt.close(figure)
 
 
-def plot_accuracy_cost_unfairness_trajectory(
+
+def _plot_method_step(
+    axis: plt.Axes,
+    frame: pd.DataFrame,
+    *,
+    metric: str,
+    title: str,
+    ylabel: str,
+    legend: bool = False,
+) -> None:
+    """Draw one real-state step trajectory in the established BBQ style."""
+    for optimizer in METHOD_ORDER:
+        group = frame[
+            frame["optimizer"] == optimizer
+        ].sort_values("actual_budget_tokens")
+        if group.empty:
+            continue
+        x = (
+            pd.to_numeric(
+                group["actual_budget_tokens"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            / 1_000_000.0
+        )
+        y = pd.to_numeric(
+            group[metric],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        valid = np.isfinite(x) & np.isfinite(y)
+        axis.step(
+            x[valid],
+            y[valid],
+            where="post",
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            markevery=max(1, int(valid.sum() / 8)),
+            linewidth=2,
+            markersize=4,
+            label=DISPLAY_NAME[optimizer],
+        )
+    axis.set_title(title)
+    axis.set_xlabel("Cumulative Downstream Tokens [×10⁶]")
+    axis.set_ylabel(ylabel)
+    axis.set_xlim(left=0.0, right=BUDGET / 1_000_000.0)
+    axis.grid(True, alpha=0.25)
+    if legend:
+        axis.legend(frameon=False)
+
+
+def plot_stepwise_development_objectives(
     trajectory: pd.DataFrame,
     output_dir: Path,
     formats: Sequence[str],
 ) -> None:
-    figure, axes = plt.subplots(
-        2,
-        3,
-        figsize=(13.5, 7.2),
-        constrained_layout=True,
-        sharex="col",
-    )
-
-    specifications = (
+    """Accuracy/cost/unfairness trajectories using objective-specific prompts."""
+    specs = (
         (
             "accuracy_first",
             "dev_quality",
-            "test_quality",
             "Best Development Accuracy ↑",
-            "Held-out Accuracy of\nDevelopment Accuracy Champion ↑",
-            "Accuracy",
+            "Development Accuracy",
         ),
         (
             "cost_first",
             "dev_cost",
-            "test_cost",
             "Lowest Development Cost ↓",
-            "Held-out Cost of\nDevelopment Cost Champion ↓",
-            "Weighted Mean-Token Cost",
+            "Cost Objective ↓",
         ),
         (
             "fairness_first",
             "dev_fairness",
-            "test_fairness",
             "Lowest Development Unfairness ↓",
-            "Held-out Unfairness of\nDevelopment Fairness Champion ↓",
-            "Unfairness",
+            "Statistical BBQ Unfairness ↓",
         ),
     )
-
-    for column_index, (
-        policy,
-        dev_column,
-        heldout_column,
-        dev_title,
-        heldout_title,
-        ylabel,
-    ) in enumerate(specifications):
-        for optimizer in METHOD_ORDER:
-            group = trajectory[
-                (trajectory["optimizer"] == optimizer)
-                & (trajectory["policy"] == policy)
-            ].sort_values("actual_budget_tokens")
-
-            x = group["actual_budget_tokens"].to_numpy(dtype=float) / 1_000_000.0
-            axes[0, column_index].plot(
-                x,
-                group[dev_column],
-                color=COLORS[optimizer],
-                marker=MARKERS[optimizer],
-                linestyle=LINESTYLES[optimizer],
-                linewidth=2.0,
-                markersize=5,
-                label=DISPLAY_NAME[optimizer],
-            )
-            axes[1, column_index].plot(
-                x,
-                group[heldout_column],
-                color=COLORS[optimizer],
-                marker=MARKERS[optimizer],
-                linestyle=LINESTYLES[optimizer],
-                linewidth=2.0,
-                markersize=5,
-                label=DISPLAY_NAME[optimizer],
-            )
-
-        axes[0, column_index].set_title(dev_title)
-        axes[1, column_index].set_title(heldout_title)
-        axes[0, column_index].set_ylabel(ylabel)
-        axes[1, column_index].set_ylabel(ylabel)
-        axes[1, column_index].set_xlabel(
-            "Cumulative Downstream Tokens [×10⁶]"
+    figure, axes = plt.subplots(
+        1,
+        3,
+        figsize=(13.2, 3.9),
+        constrained_layout=True,
+    )
+    for index, (axis, (policy, metric, title, ylabel)) in enumerate(
+        zip(axes, specs)
+    ):
+        data = trajectory[trajectory["policy"] == policy]
+        _plot_method_step(
+            axis,
+            data,
+            metric=metric,
+            title=title,
+            ylabel=ylabel,
+            legend=index == 0,
         )
-        axes[0, column_index].grid(True, alpha=0.25)
-        axes[1, column_index].grid(True, alpha=0.25)
-        axes[0, column_index].set_xlim(0.0, BUDGET / 1_000_000.0)
-        axes[1, column_index].set_xlim(0.0, BUDGET / 1_000_000.0)
-
-    axes[0, 0].legend(frameon=False, loc="best")
     figure.suptitle(
-        "BBQ — Qwen-3-30B Tri-Fair v6 Matched 2M Smoke Run"
+        "BBQ v6 — Qwen-3-30B: Development Objective Trajectories"
     )
     save_figure(
         figure,
         output_dir,
-        "bbq_v6_smoke_2m_accuracy_cost_unfairness_trajectory",
+        "bbq_qwen3_2m_v6_development_accuracy_cost_unfairness",
         formats,
     )
 
 
-def plot_final_development_heldout_policies(
+def plot_stepwise_heldout_objectives(
     trajectory: pd.DataFrame,
     output_dir: Path,
     formats: Sequence[str],
 ) -> None:
-    final_rows = (
-        trajectory.sort_values("actual_budget_tokens")
-        .groupby(["optimizer", "policy"], as_index=False)
+    """Held-out values of the prompts selected at each state on development."""
+    specs = (
+        (
+            "accuracy_first",
+            "test_quality",
+            "Held-out Accuracy of Accuracy Champion ↑",
+            "Held-out Accuracy",
+        ),
+        (
+            "cost_first",
+            "test_cost",
+            "Held-out Cost of Cost Champion ↓",
+            "Cost Objective ↓",
+        ),
+        (
+            "fairness_first",
+            "test_fairness",
+            "Held-out Unfairness of Fairness Champion ↓",
+            "Statistical BBQ Unfairness ↓",
+        ),
+    )
+    figure, axes = plt.subplots(
+        1,
+        3,
+        figsize=(13.2, 3.9),
+        constrained_layout=True,
+    )
+    for index, (axis, (policy, metric, title, ylabel)) in enumerate(
+        zip(axes, specs)
+    ):
+        data = trajectory[trajectory["policy"] == policy]
+        _plot_method_step(
+            axis,
+            data,
+            metric=metric,
+            title=title,
+            ylabel=ylabel,
+            legend=index == 0,
+        )
+    figure.suptitle(
+        "BBQ v6 — Qwen-3-30B: Development-selected Held-out Trajectories"
+    )
+    save_figure(
+        figure,
+        output_dir,
+        "bbq_qwen3_2m_v6_heldout_accuracy_cost_unfairness",
+        formats,
+    )
+
+
+def plot_stepwise_nr2(
+    mo_trajectory: pd.DataFrame,
+    output_dir: Path,
+    formats: Sequence[str],
+) -> None:
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(10.2, 4.0),
+        constrained_layout=True,
+    )
+    _plot_method_step(
+        axes[0],
+        mo_trajectory,
+        metric="dev_nr2",
+        title="Development nR2 Proxy ↓",
+        ylabel="Development nR2 Proxy",
+        legend=True,
+    )
+    _plot_method_step(
+        axes[1],
+        mo_trajectory,
+        metric="heldout_nr2",
+        title="Exact Held-out nR2 ↓",
+        ylabel="Held-out nR2",
+    )
+    axes[0].text(
+        0.02,
+        0.02,
+        "Development-side proxy computed at real optimizer states.",
+        transform=axes[0].transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=7,
+        alpha=0.75,
+    )
+    figure.suptitle("BBQ v6 — Qwen-3-30B at 2M")
+    save_figure(
+        figure,
+        output_dir,
+        "bbq_qwen3_2m_v6_stepwise_nr2",
+        formats,
+    )
+
+
+def plot_stepwise_hv_and_gap(
+    mo_trajectory: pd.DataFrame,
+    output_dir: Path,
+    formats: Sequence[str],
+) -> None:
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(10.2, 4.0),
+        constrained_layout=True,
+    )
+    _plot_method_step(
+        axes[0],
+        mo_trajectory,
+        metric="dev_hv",
+        title="Development Hypervolume ↑",
+        ylabel="Development HV",
+        legend=True,
+    )
+    _plot_method_step(
+        axes[1],
+        mo_trajectory,
+        metric="hv_generalization_gap",
+        title="Absolute HV Generalization Gap ↓",
+        ylabel="Absolute HV Gap",
+    )
+    figure.suptitle("BBQ v6 — Qwen-3-30B at 2M")
+    save_figure(
+        figure,
+        output_dir,
+        "bbq_qwen3_2m_v6_stepwise_hv_gap",
+        formats,
+    )
+
+
+def _annotated_method_bar(
+    axis: plt.Axes,
+    final_metrics: pd.DataFrame,
+    *,
+    metric: str,
+    title: str,
+) -> None:
+    values: list[float] = []
+    labels: list[str] = []
+    colors: list[str] = []
+    for optimizer in METHOD_ORDER:
+        group = final_metrics[
+            final_metrics["optimizer"] == optimizer
+        ]
+        if group.empty:
+            values.append(float("nan"))
+        else:
+            values.append(float(group.iloc[-1][metric]))
+        labels.append(DISPLAY_NAME[optimizer])
+        colors.append(COLORS[optimizer])
+
+    positions = np.arange(len(METHOD_ORDER), dtype=float)
+    bars = axis.bar(
+        positions,
+        values,
+        color=colors,
+        alpha=0.82,
+        width=0.62,
+    )
+    axis.set_xticks(positions, labels, rotation=8)
+    axis.set_title(title)
+    axis.grid(True, axis="y", alpha=0.25)
+    for bar, value in zip(bars, values):
+        if not np.isfinite(value):
+            continue
+        axis.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{value:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+
+def plot_final_method_comparison(
+    mo_trajectory: pd.DataFrame,
+    output_dir: Path,
+    formats: Sequence[str],
+) -> None:
+    final = (
+        mo_trajectory.sort_values("actual_budget_tokens")
+        .groupby("optimizer", as_index=False)
         .tail(1)
+    )
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=(9.0, 7.0),
+        constrained_layout=True,
+    )
+    specs = (
+        ("heldout_hv", "Held-out Hypervolume ↑"),
+        ("dev_hv", "Development Hypervolume ↑"),
+        ("heldout_nr2", "Held-out nR2 ↓"),
+        ("hv_generalization_gap", "Absolute HV Gap ↓"),
+    )
+    for axis, (metric, title) in zip(axes.ravel(), specs):
+        _annotated_method_bar(
+            axis,
+            final,
+            metric=metric,
+            title=title,
+        )
+    figure.suptitle(
+        "BBQ v6 — Qwen-3-30B at 2M (one matched smoke seed)"
+    )
+    save_figure(
+        figure,
+        output_dir,
+        "bbq_qwen3_2m_v6_method_comparison_hv_nr2_gap",
+        formats,
+    )
+
+
+def _final_policy_rows(
+    trajectory: pd.DataFrame,
+    policy: str,
+) -> pd.DataFrame:
+    return (
+        trajectory[trajectory["policy"] == policy]
+        .sort_values("actual_budget_tokens")
+        .groupby("optimizer", as_index=False)
+        .tail(1)
+    )
+
+
+def plot_high_accuracy_operating_points(
+    trajectory: pd.DataFrame,
+    output_dir: Path,
+    formats: Sequence[str],
+    *,
+    threshold: float,
+) -> pd.DataFrame:
+    points = _final_policy_rows(
+        trajectory,
+        "high_accuracy_fairness",
+    ).copy()
+    points.to_csv(
+        output_dir
+        / "bbq_qwen3_2m_v6_high_accuracy_operating_points.csv",
+        index=False,
     )
 
     figure, axes = plt.subplots(
         1,
         3,
-        figsize=(13.2, 4.2),
+        figsize=(13.2, 3.9),
         constrained_layout=True,
     )
-    specifications = (
+    specs = (
+        ("test_quality", "Accuracy ↑", "Held-out Accuracy"),
+        ("test_cost", "Cost ↓", "Cost Objective ↓"),
         (
-            "accuracy_first",
-            "dev_quality",
-            "test_quality",
-            "Accuracy-first Prompt",
-            "Accuracy",
-        ),
-        (
-            "cost_first",
-            "dev_cost",
-            "test_cost",
-            "Cost-first Prompt",
-            "Weighted Mean-Token Cost",
-        ),
-        (
-            "fairness_first",
-            "dev_fairness",
             "test_fairness",
-            "Fairness-first Prompt",
-            "Unfairness",
+            "Unfairness ↓",
+            "Statistical BBQ Unfairness ↓",
         ),
     )
-
-    x = np.arange(len(METHOD_ORDER), dtype=float)
-    width = 0.32
-
-    for axis, (
-        policy,
-        dev_column,
-        heldout_column,
-        title,
-        ylabel,
-    ) in zip(axes, specifications):
-        selected = final_rows[final_rows["policy"] == policy]
-        dev_values = [
+    positions = np.arange(len(METHOD_ORDER), dtype=float)
+    for axis, (metric, title, ylabel) in zip(axes, specs):
+        values = [
             float(
-                selected.loc[
-                    selected["optimizer"] == optimizer,
-                    dev_column,
+                points.loc[
+                    points["optimizer"] == optimizer,
+                    metric,
                 ].iloc[0]
             )
             for optimizer in METHOD_ORDER
         ]
-        heldout_values = [
-            float(
-                selected.loc[
-                    selected["optimizer"] == optimizer,
-                    heldout_column,
-                ].iloc[0]
-            )
-            for optimizer in METHOD_ORDER
-        ]
-
-        axis.bar(
-            x - width / 2,
-            dev_values,
-            width,
-            color=[COLORS[optimizer] for optimizer in METHOD_ORDER],
-            alpha=0.45,
-            label="Development",
-        )
-        axis.bar(
-            x + width / 2,
-            heldout_values,
-            width,
-            color=[COLORS[optimizer] for optimizer in METHOD_ORDER],
-            alpha=0.92,
-            hatch="//",
-            label="Held-out",
+        bars = axis.bar(
+            positions,
+            values,
+            color=[COLORS[value] for value in METHOD_ORDER],
+            alpha=0.82,
+            width=0.62,
         )
         axis.set_xticks(
-            x,
-            [DISPLAY_NAME[optimizer] for optimizer in METHOD_ORDER],
-            rotation=7,
+            positions,
+            [DISPLAY_NAME[value] for value in METHOD_ORDER],
+            rotation=8,
         )
         axis.set_title(title)
         axis.set_ylabel(ylabel)
         axis.grid(True, axis="y", alpha=0.25)
-
-    axes[0].legend(frameon=False)
-    figure.suptitle(
-        "BBQ — Final Development-selected Prompts at the 2M Real States"
-    )
-    save_figure(
-        figure,
-        output_dir,
-        "bbq_v6_smoke_2m_final_development_vs_heldout",
-        formats,
-    )
-
-
-def plot_nr2(
-    mo_trajectory: pd.DataFrame,
-    output_dir: Path,
-    formats: Sequence[str],
-) -> None:
-    figure, axes = plt.subplots(
-        1,
-        2,
-        figsize=(11.0, 4.2),
-        constrained_layout=True,
-    )
-
-    for optimizer in METHOD_ORDER:
-        group = mo_trajectory[
-            mo_trajectory["optimizer"] == optimizer
-        ].sort_values("actual_budget_tokens")
-        x = group["actual_budget_tokens"].to_numpy(dtype=float) / 1_000_000.0
-
-        axes[0].plot(
-            x,
-            group["dev_nr2"],
-            color=COLORS[optimizer],
-            marker=MARKERS[optimizer],
-            linestyle=LINESTYLES[optimizer],
-            linewidth=2,
-            markersize=5,
-            label=DISPLAY_NAME[optimizer],
-        )
-
-        final = group.iloc[-1]
-        axes[1].scatter(
-            [DISPLAY_NAME[optimizer]],
-            [final["heldout_nr2"]],
-            color=COLORS[optimizer],
-            marker=MARKERS[optimizer],
-            s=90,
-            label=DISPLAY_NAME[optimizer],
-        )
-
-    axes[0].set_title("A. Development nR2 Proxy ↓")
-    axes[0].set_xlabel("Cumulative Downstream Tokens [×10⁶]")
-    axes[0].set_ylabel("Development nR2 Proxy")
-    axes[0].set_xlim(0.0, BUDGET / 1_000_000.0)
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(frameon=False)
-
-    axes[1].set_title("B. Exact Final Held-out nR2 ↓")
-    axes[1].set_ylabel("Held-out nR2")
-    axes[1].grid(True, axis="y", alpha=0.25)
-
-    figure.suptitle(
-        "BBQ — Qwen-3-30B Tri-Fair v6 Matched 2M nR2"
-    )
-    save_figure(
-        figure,
-        output_dir,
-        "bbq_v6_smoke_2m_nr2_development_heldout",
-        formats,
-    )
-
-
-def plot_hypervolume_gap(
-    mo_trajectory: pd.DataFrame,
-    output_dir: Path,
-    formats: Sequence[str],
-) -> None:
-    figure, axes = plt.subplots(
-        1,
-        3,
-        figsize=(13.4, 4.1),
-        constrained_layout=True,
-    )
-    specifications = (
-        ("dev_hv", "Development Hypervolume ↑", "Hypervolume"),
-        ("heldout_hv", "Held-out Hypervolume ↑", "Hypervolume"),
-        (
-            "hv_generalization_gap",
-            "Absolute HV Generalization Gap ↓",
-            "Absolute Gap",
-        ),
-    )
-
-    for axis, (metric, title, ylabel) in zip(axes, specifications):
-        for optimizer in METHOD_ORDER:
-            group = mo_trajectory[
-                mo_trajectory["optimizer"] == optimizer
-            ].sort_values("actual_budget_tokens")
-            axis.plot(
-                group["actual_budget_tokens"].to_numpy(dtype=float)
-                / 1_000_000.0,
-                group[metric],
-                color=COLORS[optimizer],
-                marker=MARKERS[optimizer],
-                linestyle=LINESTYLES[optimizer],
-                linewidth=2,
-                markersize=5,
-                label=DISPLAY_NAME[optimizer],
+        for bar, value in zip(bars, values):
+            axis.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f"{value:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
             )
-
-        axis.set_title(title)
-        axis.set_xlabel("Cumulative Downstream Tokens [×10⁶]")
-        axis.set_ylabel(ylabel)
-        axis.set_xlim(0.0, BUDGET / 1_000_000.0)
-        axis.grid(True, alpha=0.25)
-
-    axes[0].legend(frameon=False)
+    axes[0].axhline(
+        threshold,
+        color="0.5",
+        linestyle="--",
+        linewidth=1,
+    )
     figure.suptitle(
-        "BBQ — Development and Held-out Pareto-set Generalization"
+        f"BBQ v6 — Lowest Development Unfairness with Accuracy ≥ {threshold:.2f}"
     )
     save_figure(
         figure,
         output_dir,
-        "bbq_v6_smoke_2m_hypervolume_gap_trajectory",
+        "bbq_qwen3_2m_v6_high_accuracy_operating_points",
         formats,
     )
+    return points
 
 
 def y_attained_at_x(
@@ -1146,9 +1236,13 @@ def y_attained_at_x(
     x_grid: np.ndarray,
     x_column: str,
 ) -> np.ndarray:
-    x = pd.to_numeric(frame[x_column], errors="coerce").to_numpy(dtype=float)
+    x = pd.to_numeric(
+        frame[x_column],
+        errors="coerce",
+    ).to_numpy(dtype=float)
     accuracy = pd.to_numeric(
-        frame["test_quality"], errors="coerce"
+        frame["test_quality"],
+        errors="coerce",
     ).to_numpy(dtype=float)
     valid = np.isfinite(x) & np.isfinite(accuracy)
     x = x[valid]
@@ -1162,148 +1256,139 @@ def y_attained_at_x(
     return output
 
 
-def plot_attainment(
+def plot_empirical_attainment(
     final_valid: pd.DataFrame,
     output_dir: Path,
     formats: Sequence[str],
     *,
     x_column: str,
     xlabel: str,
-    suffix: str,
+    filename: str,
 ) -> None:
     values = pd.to_numeric(
-        final_valid[x_column], errors="coerce"
+        final_valid[x_column],
+        errors="coerce",
     ).dropna()
     if values.empty:
         return
-
     minimum = float(values.min())
     maximum = float(values.max())
     padding = 0.03 * max(maximum - minimum, 1e-6)
-    x_grid = np.linspace(
+    grid = np.linspace(
         minimum - padding,
         maximum + padding,
-        500,
+        400,
     )
 
     figure, axis = plt.subplots(
-        figsize=(6.8, 4.5),
+        figsize=(6.6, 4.2),
         constrained_layout=True,
     )
-
     for optimizer in METHOD_ORDER:
         method = final_valid[
             final_valid["optimizer"] == optimizer
         ].copy()
         front = pareto_rows(method, split="test")
-        curve = y_attained_at_x(front, x_grid, x_column)
+        curve = y_attained_at_x(front, grid, x_column)
         valid = np.isfinite(curve)
-
         axis.step(
-            x_grid[valid],
+            grid[valid],
             curve[valid],
             where="post",
             color=COLORS[optimizer],
             marker=MARKERS[optimizer],
-            linestyle=LINESTYLES[optimizer],
             markevery=max(1, int(valid.sum() / 8)),
-            linewidth=2.1,
-            markersize=4.5,
+            linewidth=2,
+            markersize=4,
             label=DISPLAY_NAME[optimizer],
         )
-
-    axis.set_title("BBQ — Final Held-out Empirical Attainment")
+    axis.set_title("BBQ v6 — Qwen-3-30B at 2M")
     axis.set_xlabel(xlabel)
-    axis.set_ylabel("Held-out Accuracy ↑")
+    axis.set_ylabel("Held-out Accuracy")
     axis.grid(True, alpha=0.25)
     axis.legend(frameon=False, loc="lower right")
-
     save_figure(
         figure,
         output_dir,
-        f"bbq_v6_smoke_2m_attainment_accuracy_{suffix}",
+        filename,
         formats,
     )
 
 
-def plot_cost_unfairness_pareto(
+def plot_cost_unfairness_projection(
     final_valid: pd.DataFrame,
     output_dir: Path,
     formats: Sequence[str],
 ) -> None:
     figure, axis = plt.subplots(
-        figsize=(6.8, 4.7),
+        figsize=(6.6, 4.5),
         constrained_layout=True,
     )
-
     for optimizer in METHOD_ORDER:
         method = final_valid[
             final_valid["optimizer"] == optimizer
         ].copy()
         front = pareto_rows(method, split="test")
+        if front.empty:
+            continue
         axis.scatter(
             front["test_cost"],
             front["test_fairness"],
-            c=front["test_quality"],
-            cmap="viridis",
+            color=COLORS[optimizer],
             marker=MARKERS[optimizer],
-            edgecolor=COLORS[optimizer],
-            linewidth=1.0,
-            alpha=0.82,
-            s=64,
-            label=DISPLAY_NAME[optimizer],
+            alpha=0.35,
+            s=28,
         )
-
         projection = np.column_stack(
             (
                 pd.to_numeric(
-                    front["test_cost"], errors="coerce"
+                    front["test_cost"],
+                    errors="coerce",
                 ).to_numpy(dtype=float),
                 pd.to_numeric(
-                    front["test_fairness"], errors="coerce"
+                    front["test_fairness"],
+                    errors="coerce",
                 ).to_numpy(dtype=float),
             )
         )
         valid = np.all(np.isfinite(projection), axis=1)
         projected = front.loc[valid].reset_index(drop=True)
         projection = projection[valid]
-        if len(projected):
-            projected = projected.loc[
-                pareto_mask_minimise(projection)
-            ].sort_values("test_cost")
-            axis.plot(
-                projected["test_cost"],
-                projected["test_fairness"],
-                color=COLORS[optimizer],
-                linestyle=LINESTYLES[optimizer],
-                linewidth=2,
-            )
-
-    axis.set_title("BBQ — Final Held-out Cost–Unfairness Pareto Front")
+        projected = projected.loc[
+            pareto_mask_minimise(projection)
+        ].sort_values("test_cost")
+        axis.plot(
+            projected["test_cost"],
+            projected["test_fairness"],
+            color=COLORS[optimizer],
+            marker=MARKERS[optimizer],
+            linewidth=2,
+            markersize=5,
+            label=DISPLAY_NAME[optimizer],
+        )
+    axis.set_title("BBQ v6 — 2M Cost vs Held-out Unfairness")
     axis.set_xlabel("Weighted Mean-Token Cost ↓")
-    axis.set_ylabel("Held-out Unfairness ↓")
+    axis.set_ylabel("Statistical BBQ Unfairness ↓")
     axis.grid(True, alpha=0.25)
     axis.legend(frameon=False)
-
     save_figure(
         figure,
         output_dir,
-        "bbq_v6_smoke_2m_pareto_cost_unfairness",
+        "bbq_qwen3_2m_v6_pareto_cost_unfairness",
         formats,
     )
 
 
-def plot_three_dimensional_pareto(
+def plot_three_objective_pareto(
     final_valid: pd.DataFrame,
     output_dir: Path,
     formats: Sequence[str],
 ) -> None:
     figure = plt.figure(
-        figsize=(7.5, 5.8),
+        figsize=(7.2, 5.5),
         constrained_layout=True,
     )
     axis = figure.add_subplot(111, projection="3d")
-
     for optimizer in METHOD_ORDER:
         method = final_valid[
             final_valid["optimizer"] == optimizer
@@ -1315,82 +1400,167 @@ def plot_three_dimensional_pareto(
             front["test_quality"],
             color=COLORS[optimizer],
             marker=MARKERS[optimizer],
-            alpha=0.82,
-            s=48,
+            alpha=0.78,
+            s=34,
             label=DISPLAY_NAME[optimizer],
         )
-
     axis.set_title(
-        "BBQ — Qwen-3-30B Final Held-out Pareto Fronts at 2M"
+        "BBQ v6 — Qwen-3-30B 2M Held-out Pareto Fronts"
     )
-    axis.set_xlabel("Weighted Mean-Token Cost ↓")
-    axis.set_ylabel("Held-out Unfairness ↓")
-    axis.set_zlabel("Held-out Accuracy ↑")
+    axis.set_xlabel("Cost Objective ↓")
+    axis.set_ylabel("Statistical BBQ Unfairness ↓")
+    axis.set_zlabel("Accuracy ↑")
     axis.legend(frameon=False)
-
     save_figure(
         figure,
         output_dir,
-        "bbq_v6_smoke_2m_heldout_pareto_3d",
+        "bbq_qwen3_2m_v6_heldout_pareto_3d",
         formats,
     )
 
 
-def plot_few_shot_diagnostics(
+def plot_trifair_diagnostic(
     final_valid: pd.DataFrame,
     output_dir: Path,
     formats: Sequence[str],
+    *,
+    color_column: str,
+    color_label: str,
+    filename: str,
 ) -> None:
-    data = attach_few_shot_diagnostics(final_valid)
-    figure, axes = plt.subplots(
-        1,
-        2,
-        figsize=(11.5, 4.3),
+    data = attach_few_shot_diagnostics(
+        final_valid[
+            final_valid["optimizer"] == "Tri-Fair-v6"
+        ].copy()
+    )
+    data = data.dropna(
+        subset=(
+            "test_cost",
+            "test_quality",
+            color_column,
+        )
+    )
+    if data.empty:
+        return
+
+    values = pd.to_numeric(
+        data[color_column],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    minimum = float(np.nanmin(values))
+    maximum = float(np.nanmax(values))
+    if np.isclose(minimum, maximum):
+        maximum = minimum + 1e-6
+
+    figure, axis = plt.subplots(
+        figsize=(6.6, 4.8),
         constrained_layout=True,
     )
-
-    for optimizer in METHOD_ORDER:
-        group = data[data["optimizer"] == optimizer]
-        axes[0].scatter(
-            group["few_shot_count"],
-            100.0 * group["heldout_output_cost_share"],
-            color=COLORS[optimizer],
-            marker=MARKERS[optimizer],
-            s=60,
-            alpha=0.78,
-            label=DISPLAY_NAME[optimizer],
-        )
-        axes[1].scatter(
-            group["few_shot_count"],
-            group["test_fairness"],
-            color=COLORS[optimizer],
-            marker=MARKERS[optimizer],
-            s=60,
-            alpha=0.78,
-            label=DISPLAY_NAME[optimizer],
-        )
-
-    axes[0].set_title("A. Few-shot Count and Output-Cost Share")
-    axes[0].set_xlabel("Number of Few-shot Examples")
-    axes[0].set_ylabel("Held-out Output-Cost Share [%]")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(frameon=False)
-
-    axes[1].set_title("B. Few-shot Count and Held-out Unfairness")
-    axes[1].set_xlabel("Number of Few-shot Examples")
-    axes[1].set_ylabel("Held-out Unfairness ↓")
-    axes[1].grid(True, alpha=0.25)
-
-    figure.suptitle(
-        "BBQ — Final 2M Few-shot Diagnostics"
+    scatter = axis.scatter(
+        data["test_cost"],
+        data["test_quality"],
+        c=values,
+        cmap="viridis",
+        vmin=minimum,
+        vmax=maximum,
+        edgecolor="black",
+        linewidth=0.5,
+        s=72,
+        alpha=0.95,
     )
+    for _, row in data.iterrows():
+        axis.text(
+            float(row["test_cost"]),
+            float(row["test_quality"]) + 0.002,
+            str(int(row["few_shot_count"])),
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
+    axis.set_title(
+        "Tri-Fair v6 on BBQ — Qwen-3-30B at 2M"
+    )
+    axis.set_xlabel("Weighted Mean-Token Cost ↓")
+    axis.set_ylabel("Held-out Accuracy")
+    axis.grid(True, alpha=0.25)
+    colorbar = figure.colorbar(scatter, ax=axis)
+    colorbar.set_label(color_label)
     save_figure(
         figure,
         output_dir,
-        "bbq_v6_smoke_2m_few_shot_diagnostics",
+        filename,
         formats,
     )
 
+
+def plot_coverage_validity_diagnostics(
+    final: pd.DataFrame,
+    output_dir: Path,
+    formats: Sequence[str],
+) -> None:
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(10.8, 4.2),
+        constrained_layout=True,
+    )
+    positions = np.arange(len(METHOD_ORDER), dtype=float)
+    fractions = [
+        float(
+            final.loc[
+                final["optimizer"] == optimizer,
+                "publication_valid",
+            ].fillna(False).astype(bool).mean()
+        )
+        for optimizer in METHOD_ORDER
+    ]
+    axes[0].bar(
+        positions,
+        fractions,
+        color=[COLORS[value] for value in METHOD_ORDER],
+        alpha=0.82,
+        width=0.62,
+    )
+    axes[0].set_xticks(
+        positions,
+        [DISPLAY_NAME[value] for value in METHOD_ORDER],
+        rotation=8,
+    )
+    axes[0].set_ylim(0.0, 1.05)
+    axes[0].set_ylabel("Publication-valid Candidate Fraction")
+    axes[0].set_title("Coverage-valid Final Archive")
+    axes[0].grid(True, axis="y", alpha=0.25)
+
+    valid = final[final["publication_valid"]].copy()
+    invalid = final[~final["publication_valid"]].copy()
+    for optimizer in METHOD_ORDER:
+        for subset, alpha, label in (
+            (valid, 0.78, "valid"),
+            (invalid, 0.18, "invalid"),
+        ):
+            group = subset[subset["optimizer"] == optimizer]
+            axes[1].scatter(
+                group["test_fairness"],
+                group["test_quality"],
+                color=COLORS[optimizer],
+                marker=MARKERS[optimizer],
+                alpha=alpha,
+                s=32,
+                label=f"{DISPLAY_NAME[optimizer]} {label}",
+            )
+    axes[1].set_xlabel("Statistical BBQ Unfairness ↓")
+    axes[1].set_ylabel("Held-out Accuracy")
+    axes[1].set_title("Validity and Held-out Objectives")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(frameon=False, fontsize=7.5)
+
+    figure.suptitle("BBQ v6 — Qwen-3-30B at 2M")
+    save_figure(
+        figure,
+        output_dir,
+        "bbq_qwen3_2m_v6_coverage_validity_diagnostics",
+        formats,
+    )
 
 def build_final_summary(
     evaluations: pd.DataFrame,
@@ -1517,7 +1687,7 @@ def write_readme(
         f"- {DISPLAY_NAME[optimizer]}: `{run.evaluation_path}`"
         for optimizer, run in run_files.items()
     )
-    content = f"""# BBQ Tri-Fair v6 matched 2M smoke-run figures
+    content = f"""# BBQ Tri-Fair v6 matched 2M publication-style smoke figures
 
 ## Sources
 
@@ -1536,7 +1706,7 @@ the held-out split.  Balanced points are not used.
 ## Labels
 
 BBQ quality is accuracy, so every figure uses `Accuracy` rather than
-`Test Quality`.
+`Accuracy`.
 
 ## Multi-objective diagnostics
 
@@ -1549,8 +1719,7 @@ The script uses minimisation objectives:
 Hypervolume uses reference point {tuple(REFERENCE_POINT.tolist())}.  nR2 is a
 deterministic simplex-weight Tchebycheff indicator; lower is better.
 
-The figures contain one seed and therefore do not show standard-deviation
-bands.  The full study should show all seed points plus mean and sample SD.
+The figures contain one seed and therefore show real-state lines and final values without standard-deviation bands.  The full study should show all seed points plus mean and sample SD.
 """
     (output_dir / "README.md").write_text(content, encoding="utf-8")
 
@@ -1633,19 +1802,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise RuntimeError("The final valid candidate table is empty")
 
     evaluations.to_parquet(
-        output_dir / "bbq_v6_smoke_2m_all_evaluations_with_validity.parquet",
+        output_dir / "bbq_v6_2m_all_evaluations_with_validity.parquet",
         index=False,
     )
     final_valid.to_parquet(
-        output_dir / "bbq_v6_smoke_2m_final_valid_candidates.parquet",
+        output_dir / "bbq_v6_2m_final_valid_candidates.parquet",
         index=False,
     )
     policy_trajectory.to_csv(
-        output_dir / "bbq_v6_smoke_2m_development_selected_trajectory.csv",
+        output_dir / "bbq_v6_2m_development_selected_trajectory.csv",
         index=False,
     )
     mo_trajectory.to_csv(
-        output_dir / "bbq_v6_smoke_2m_multiobjective_trajectory.csv",
+        output_dir / "bbq_v6_2m_multiobjective_trajectory.csv",
         index=False,
     )
 
@@ -1656,68 +1825,95 @@ def main(argv: Sequence[str] | None = None) -> None:
         summaries,
     )
     final_summary.to_csv(
-        output_dir / "bbq_v6_smoke_2m_summary.csv",
+        output_dir / "bbq_v6_2m_summary.csv",
         index=False,
     )
     safe_markdown(
         final_summary,
-        output_dir / "bbq_v6_smoke_2m_summary.md",
+        output_dir / "bbq_v6_2m_summary.md",
     )
 
     audit = shared_prompt_audit(final_valid)
     audit.to_csv(
-        output_dir / "bbq_v6_smoke_2m_shared_prompt_audit.csv",
+        output_dir / "bbq_v6_2m_shared_prompt_audit.csv",
         index=False,
     )
 
-    plot_accuracy_cost_unfairness_trajectory(
+    plot_stepwise_development_objectives(
         policy_trajectory,
         output_dir,
         formats,
     )
-    plot_final_development_heldout_policies(
+    plot_stepwise_heldout_objectives(
         policy_trajectory,
         output_dir,
         formats,
     )
-    plot_nr2(
+    plot_stepwise_nr2(
         mo_trajectory,
         output_dir,
         formats,
     )
-    plot_hypervolume_gap(
+    plot_stepwise_hv_and_gap(
         mo_trajectory,
         output_dir,
         formats,
     )
-    plot_attainment(
+    plot_final_method_comparison(
+        mo_trajectory,
+        output_dir,
+        formats,
+    )
+    plot_high_accuracy_operating_points(
+        policy_trajectory,
+        output_dir,
+        formats,
+        threshold=float(args.accuracy_threshold),
+    )
+    plot_empirical_attainment(
         final_valid,
         output_dir,
         formats,
         x_column="test_cost",
-        xlabel="Held-out Weighted Mean-Token Cost ↓",
-        suffix="cost",
+        xlabel="Weighted Mean-Token Cost ↓",
+        filename="bbq_qwen3_2m_v6_attainment_accuracy_cost",
     )
-    plot_attainment(
+    plot_empirical_attainment(
         final_valid,
         output_dir,
         formats,
         x_column="test_fairness",
-        xlabel="Held-out Unfairness ↓",
-        suffix="unfairness",
+        xlabel="Statistical BBQ Unfairness ↓",
+        filename="bbq_qwen3_2m_v6_attainment_accuracy_unfairness",
     )
-    plot_cost_unfairness_pareto(
+    plot_cost_unfairness_projection(
         final_valid,
         output_dir,
         formats,
     )
-    plot_three_dimensional_pareto(
+    plot_three_objective_pareto(
         final_valid,
         output_dir,
         formats,
     )
-    plot_few_shot_diagnostics(
+    plot_trifair_diagnostic(
         final_valid,
+        output_dir,
+        formats,
+        color_column="heldout_output_cost_share",
+        color_label="Output-Cost Share",
+        filename="bbq_qwen3_2m_v6_trifair_fewshot_output_share",
+    )
+    plot_trifair_diagnostic(
+        final_valid,
+        output_dir,
+        formats,
+        color_column="test_fairness",
+        color_label="Statistical BBQ Unfairness ↓",
+        filename="bbq_qwen3_2m_v6_trifair_fewshot_unfairness",
+    )
+    plot_coverage_validity_diagnostics(
+        final,
         output_dir,
         formats,
     )
