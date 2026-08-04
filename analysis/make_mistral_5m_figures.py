@@ -17,7 +17,9 @@ all development ``step_results.parquet`` files, and generates:
 4. accuracy-cost and accuracy-unfairness empirical attainment curves;
 5. cost-unfairness and three-objective Pareto figures;
 6. high-quality operating-point comparisons;
-7. CSV and Markdown audit/summary tables.
+7. Tri-Fair few-shot diagnostics showing few-shot count, output-cost share,
+   quality, cost and unfairness;
+8. CSV and Markdown audit/summary tables.
 
 Default usage on Rocket
 -----------------------
@@ -1187,6 +1189,234 @@ def plot_high_quality(points: pd.DataFrame, spec: DatasetSpec, outdir: Path) -> 
     save_figure(figure, outdir, f"{spec.key}_mistral32_5m_high_quality_operating_points")
 
 
+
+def parse_fewshot_count(value: object) -> int:
+    """Return the number of few-shot examples encoded in one evaluation row."""
+    if value is None:
+        return 0
+    if isinstance(value, float) and math.isnan(value):
+        return 0
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    if isinstance(value, dict):
+        for key in ("examples", "few_shots", "fewshots", "items"):
+            nested = value.get(key)
+            if isinstance(nested, (list, tuple)):
+                return len(nested)
+        return 0
+
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    return parse_fewshot_count(parsed)
+
+
+def resolve_fewshot_column(frame: pd.DataFrame) -> str | None:
+    """Find the few-shot payload column used by the current result schema."""
+    preferred = (
+        "few_shots_json",
+        "fewshots_json",
+        "few_shot_examples_json",
+        "few_shots",
+        "fewshots",
+    )
+    for column in preferred:
+        if column in frame.columns:
+            return column
+    for column in frame.columns:
+        normalized = str(column).casefold().replace("-", "_")
+        if "few" in normalized and "shot" in normalized:
+            return str(column)
+    return None
+
+
+def resolve_token_columns(frame: pd.DataFrame) -> tuple[str, str] | None:
+    """Find mean input/output token columns used by holdout evaluation rows."""
+    candidate_pairs = (
+        ("test_input_tokens", "test_output_tokens"),
+        ("mean_test_input_tokens", "mean_test_output_tokens"),
+        ("input_tokens", "output_tokens"),
+        ("mean_input_tokens", "mean_output_tokens"),
+    )
+    for input_column, output_column in candidate_pairs:
+        if input_column in frame.columns and output_column in frame.columns:
+            return input_column, output_column
+    return None
+
+
+def mistral_output_cost_share(
+    frame: pd.DataFrame,
+    *,
+    strict: bool,
+) -> np.ndarray:
+    """Compute the output-token fraction of the Mistral weighted cost objective."""
+    resolved = resolve_token_columns(frame)
+    if resolved is None:
+        message = (
+            "Few-shot output-share diagnostics require input/output token columns. "
+            f"Available columns: {sorted(map(str, frame.columns))}"
+        )
+        if strict:
+            raise ValueError(message)
+        warnings.warn(message)
+        return np.full(len(frame), np.nan, dtype=float)
+
+    input_column, output_column = resolved
+    input_tokens = pd.to_numeric(frame[input_column], errors="coerce").to_numpy(dtype=float)
+    output_tokens = pd.to_numeric(frame[output_column], errors="coerce").to_numpy(dtype=float)
+    weighted_input = MISTRAL_INPUT_WEIGHT * input_tokens
+    weighted_output = MISTRAL_OUTPUT_WEIGHT * output_tokens
+    denominator = weighted_input + weighted_output
+    return np.clip(
+        np.divide(
+            weighted_output,
+            denominator,
+            out=np.full_like(weighted_output, np.nan, dtype=float),
+            where=np.isfinite(denominator) & (denominator > 0),
+        ),
+        0.0,
+        1.0,
+    )
+
+
+def trifair_fewshot_candidates(
+    evaluations: pd.DataFrame,
+    spec: DatasetSpec,
+    *,
+    strict: bool,
+) -> pd.DataFrame:
+    """Prepare final Tri-Fair candidates for few-shot diagnostic figures."""
+    data = evaluations[evaluations["optimizer"] == "Tri-Fair"].copy()
+    if data.empty:
+        raise RuntimeError(
+            f"No Tri-Fair final candidates are available for {spec.display}"
+        )
+
+    # Match the Qwen publication diagnostics: prefer the retained incumbent
+    # archive when the evaluator exposes an incumbent flag.
+    if "is_incumbent" in data.columns and data["is_incumbent"].notna().any():
+        incumbent_mask = bool_series(data, "is_incumbent", default=False)
+        incumbents = data.loc[incumbent_mask].copy()
+        if not incumbents.empty:
+            data = incumbents
+
+    fewshot_column = resolve_fewshot_column(data)
+    if fewshot_column is None:
+        message = (
+            f"No few-shot payload column was found for {spec.display}. "
+            f"Available columns: {sorted(map(str, data.columns))}"
+        )
+        if strict:
+            raise ValueError(message)
+        warnings.warn(message)
+        data["fewshot_count"] = 0
+        data["fewshot_source_column"] = ""
+    else:
+        data["fewshot_count"] = data[fewshot_column].map(parse_fewshot_count)
+        data["fewshot_source_column"] = fewshot_column
+
+    data["output_cost_share"] = mistral_output_cost_share(data, strict=strict)
+    for column in ("test_quality", "test_cost", "test_fairness"):
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(subset=["test_quality", "test_cost", "test_fairness"])
+    if data.empty:
+        raise RuntimeError(
+            f"No finite Tri-Fair few-shot diagnostic candidates remain for {spec.display}"
+        )
+
+    data["fewshot_count"] = (
+        pd.to_numeric(data["fewshot_count"], errors="coerce")
+        .fillna(0)
+        .clip(lower=0)
+        .astype(int)
+    )
+    return data.reset_index(drop=True)
+
+
+def plot_trifair_fewshot_diagnostic(
+    data: pd.DataFrame,
+    spec: DatasetSpec,
+    outdir: Path,
+    *,
+    color_column: str,
+    color_label: str,
+    suffix: str,
+) -> None:
+    """Plot Tri-Fair quality-cost candidates with few-shot counts as labels."""
+    require_columns(
+        data,
+        ["test_cost", "test_quality", "test_fairness", "fewshot_count", color_column],
+        "Tri-Fair few-shot candidates",
+    )
+    values = pd.to_numeric(data[color_column], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(values)
+    if not finite.any():
+        warnings.warn(
+            f"Skipping {spec.display} few-shot {suffix}: {color_column} has no finite values"
+        )
+        return
+
+    vmin = float(np.nanmin(values))
+    vmax = float(np.nanmax(values))
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-6
+
+    figure, axis = plt.subplots(figsize=(6.8, 4.9), constrained_layout=True)
+    scatter = axis.scatter(
+        data["test_cost"],
+        data["test_quality"],
+        c=values,
+        cmap="viridis",
+        vmin=vmin,
+        vmax=vmax,
+        edgecolor="black",
+        linewidth=0.55,
+        s=76,
+        alpha=0.94,
+    )
+
+    quality_span = float(
+        pd.to_numeric(data["test_quality"], errors="coerce").max()
+        - pd.to_numeric(data["test_quality"], errors="coerce").min()
+    )
+    label_offset = max(0.002, 0.018 * max(quality_span, 0.01))
+    for row in data.itertuples(index=False):
+        axis.text(
+            float(row.test_cost),
+            float(row.test_quality) + label_offset,
+            str(int(row.fewshot_count)),
+            ha="center",
+            va="bottom",
+            fontsize=7.2,
+            fontweight="semibold",
+        )
+
+    axis.set_title(f"Tri-Fair on {spec.display} — {MODEL_DISPLAY} at 5M")
+    axis.set_xlabel("Weighted Mean-Token Cost ↓")
+    axis.set_ylabel(spec.quality_label)
+    axis.grid(True, alpha=0.25)
+    colorbar = figure.colorbar(scatter, ax=axis)
+    colorbar.set_label(color_label)
+    axis.text(
+        0.02,
+        0.02,
+        "Point labels show the number of few-shot examples.",
+        transform=axis.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=7.4,
+        color="0.3",
+    )
+    save_figure(
+        figure,
+        outdir,
+        f"{spec.key}_mistral32_5m_trifair_fewshot_{suffix}",
+    )
+
 def write_markdown(frame: pd.DataFrame, path: Path, *, floatfmt: str = ".4f") -> None:
     try:
         text = frame.to_markdown(index=False, floatfmt=floatfmt) + "\n"
@@ -1206,6 +1436,7 @@ def write_outputs(
     run_metrics: pd.DataFrame,
     summary: pd.DataFrame,
     high_points: pd.DataFrame,
+    fewshot_candidates: pd.DataFrame,
 ) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     run_manifest = pd.DataFrame(
@@ -1228,6 +1459,10 @@ def write_outputs(
     run_metrics.to_csv(outdir / "run_metrics.csv", index=False)
     summary.to_csv(outdir / "summary.csv", index=False)
     high_points.to_csv(outdir / "high_quality_operating_points.csv", index=False)
+    fewshot_candidates.to_csv(
+        outdir / "trifair_fewshot_candidates.csv",
+        index=False,
+    )
     trajectory.to_csv(outdir / "trajectory_metrics.csv", index=False)
     raw.to_parquet(outdir / "all_evaluations_raw.parquet", index=False)
     evaluations.to_parquet(outdir / "all_evaluations_valid.parquet", index=False)
@@ -1284,6 +1519,17 @@ def write_outputs(
 - Cost objective: `{MISTRAL_INPUT_WEIGHT} × mean input tokens + {MISTRAL_OUTPUT_WEIGHT} × mean output tokens`
 - High-quality threshold: `{spec.threshold:.2f}`
 
+## Tri-Fair few-shot diagnostics
+
+- `trifair_fewshot_candidates.csv` records the final Tri-Fair candidates used.
+- `{spec.key}_mistral32_5m_trifair_fewshot_outputshare.*` colors candidates by
+  the output-token share of the weighted Mistral cost objective.
+- `{spec.key}_mistral32_5m_trifair_fewshot_unfairness.*` colors candidates by
+  holdout unfairness.
+- Numeric labels beside points are the number of few-shot examples.
+- When `is_incumbent` is available, the figures use the retained Tri-Fair
+  incumbent archive, matching the Qwen diagnostic convention.
+
 `max_test_quality`, `min_test_cost`, and `min_test_unfairness` are independent
 per-run extrema and may correspond to different prompt candidates.
 """
@@ -1334,6 +1580,11 @@ def generate_dataset(
     )
     summary = summarize_run_metrics(run_metrics, spec)
     high_points = high_quality_points(evaluations, spec)
+    fewshot_candidates = trifair_fewshot_candidates(
+        evaluations,
+        spec,
+        strict=strict,
+    )
 
     write_outputs(
         outdir,
@@ -1346,6 +1597,7 @@ def generate_dataset(
         run_metrics,
         summary,
         high_points,
+        fewshot_candidates,
     )
 
     plot_development_objectives(trajectory, spec, outdir)
@@ -1371,6 +1623,32 @@ def generate_dataset(
     plot_cost_unfairness(evaluations, spec, outdir)
     plot_three_objective(evaluations, spec, outdir)
     plot_high_quality(high_points, spec, outdir)
+    plot_trifair_fewshot_diagnostic(
+        fewshot_candidates,
+        spec,
+        outdir,
+        color_column="output_cost_share",
+        color_label="Output Token Cost Share",
+        suffix="outputshare",
+    )
+    plot_trifair_fewshot_diagnostic(
+        fewshot_candidates,
+        spec,
+        outdir,
+        color_column="test_fairness",
+        color_label=spec.fairness_label,
+        suffix="unfairness",
+    )
+
+    print("\nTri-Fair few-shot count distribution")
+    print(
+        fewshot_candidates["fewshot_count"]
+        .value_counts()
+        .sort_index()
+        .rename_axis("fewshot_count")
+        .rename("candidate_count")
+        .to_string()
+    )
 
     print("\nThree-seed summary")
     print(
