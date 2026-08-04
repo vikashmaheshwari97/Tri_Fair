@@ -17,7 +17,13 @@ from src.config.base_config import ModelConfig
 
 GPT_OSS_ALIAS = "gpt-oss-120b"
 QWEN_ALIAS = "qwen-3-30b"
+MISTRAL_ALIAS = "mistral-3-24b"
 GPT_OSS_REQUIRED_SHARDS = 15
+MISTRAL_REQUIRED_FILES = (
+    "config.json",
+    "params.json",
+    "tekken.json",
+)
 GPT_OSS_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 
 
@@ -208,6 +214,55 @@ def _resolve_gpt_oss_snapshot() -> Path:
     return snapshot
 
 
+def _mistral_snapshot_is_complete(snapshot: Path) -> tuple[bool, str]:
+    """Validate the official Mistral-format local snapshot used by vLLM."""
+
+    if not snapshot.is_dir():
+        return False, "not a directory"
+
+    missing = [
+        name for name in MISTRAL_REQUIRED_FILES if not (snapshot / name).is_file()
+    ]
+    if missing:
+        return False, f"missing {missing}"
+
+    weights = sorted(snapshot.glob("consolidated*.safetensors"))
+    if not weights:
+        return False, "missing consolidated*.safetensors weights"
+    empty = [path.name for path in weights if path.stat().st_size <= 0]
+    if empty:
+        return False, f"empty weight files {empty}"
+
+    return True, "ok"
+
+
+def _resolve_mistral_snapshot(model_config: ModelConfig) -> Path:
+    """Resolve Mistral from an explicit path or the configured model directory."""
+
+    explicit = os.environ.get("MISTRAL_LOCAL_SNAPSHOT", "").strip()
+    candidates = _unique_paths(
+        (
+            explicit or None,
+            model_config.model_storage_path,
+        )
+    )
+
+    checked: list[str] = []
+    for candidate in candidates:
+        complete, reason = _mistral_snapshot_is_complete(candidate)
+        checked.append(f"{candidate} ({reason})")
+        if complete:
+            return candidate
+
+    details = "\n  - ".join(checked) if checked else "no candidate paths"
+    raise FileNotFoundError(
+        "Mistral-Small-3.2-24B local snapshot could not be resolved. "
+        "Set MISTRAL_LOCAL_SNAPSHOT to the complete official-format model "
+        "directory containing config.json, params.json, tekken.json, and "
+        f"consolidated*.safetensors. Checked:\n  - {details}"
+    )
+
+
 def create_llm(model_config: ModelConfig, seed: int) -> VLLM:
     """Create one vLLM wrapper without mutating the shared ModelConfig."""
 
@@ -249,6 +304,11 @@ def create_llm(model_config: ModelConfig, seed: int) -> VLLM:
         llm_kwargs.pop("revision", None)
         wrapper_type = GPTOSSVLLM
         wrapper_kwargs["reasoning_effort"] = "low"
+
+    elif model_config.alias == MISTRAL_ALIAS:
+        model_name = str(_resolve_mistral_snapshot(model_config))
+        # A local directory has no Hugging Face revision to resolve.
+        llm_kwargs.pop("revision", None)
 
     return wrapper_type(
         model_name,

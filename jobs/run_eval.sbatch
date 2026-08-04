@@ -42,12 +42,29 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck source=jobs/lib/common.sh
 source jobs/lib/common.sh
 
+# Use the same verified offline snapshot as the optimization job.
+export MISTRAL_LOCAL_SNAPSHOT="${MISTRAL_LOCAL_SNAPSHOT:-$ROOT/../models/Mistral-3-24b}"
+
 tf_validate_positive_int BUDGET "$budget"
 MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2_2}"
 TF_RESULTS_NAMESPACE="${TF_RESULTS_NAMESPACE:-tri_fair_v2_3}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 EVAL_INCUMBENTS="${EVAL_INCUMBENTS:-true}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
+
+tf_contains "$model" gpt-oss-120b qwen-3-30b mistral-3-24b \
+  || tf_die "Unsupported evaluation model '$model'"
+
+if [[ "$model" == "mistral-3-24b" ]]; then
+  [[ -d "$MISTRAL_LOCAL_SNAPSHOT" ]] \
+    || tf_die "Missing Mistral model directory: $MISTRAL_LOCAL_SNAPSHOT"
+  for required_file in config.json params.json tekken.json; do
+    [[ -s "$MISTRAL_LOCAL_SNAPSHOT/$required_file" ]] \
+      || tf_die "Missing Mistral file: $MISTRAL_LOCAL_SNAPSHOT/$required_file"
+  done
+  compgen -G "$MISTRAL_LOCAL_SNAPSHOT/consolidated*.safetensors" >/dev/null \
+    || tf_die "Missing Mistral consolidated*.safetensors weights in $MISTRAL_LOCAL_SNAPSHOT"
+fi
 
 output_dir="$(tf_run_output_dir "$ROOT" "$model" "$dataset" "$optimizer" "$seed")"
 status_dir="$output_dir/status"

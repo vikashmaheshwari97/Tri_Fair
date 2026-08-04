@@ -33,11 +33,17 @@ _MISTRAL_3_24B = ModelConfig(
     model="vllm-mistralai/Mistral-Small-3.2-24B-Instruct-2506",
     alias="mistral-3-24b",
     max_model_len=3000,
-    batch_size=48,
+    batch_size=16,
     input_costs=0.08,
     output_costs=0.32,
     model_storage_path=Path("../models/Mistral-3-24b/"),
-    llm_kwargs={"revision": "95a6d26c4bfb886c58daf9d3f7332c857cb27b43"},
+    llm_kwargs={
+        "revision": "95a6d26c4bfb886c58daf9d3f7332c857cb27b43",
+        "tokenizer_mode": "mistral",
+        "config_format": "mistral",
+        "load_format": "mistral",
+        "dtype": "bfloat16",
+    },
 )
 
 ALL_MODELS: Dict[ModelType, ModelConfig] = {

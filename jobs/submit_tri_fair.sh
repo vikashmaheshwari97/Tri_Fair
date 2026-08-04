@@ -33,6 +33,7 @@ export ALLOW_PARTIAL_RESUME="${ALLOW_PARTIAL_RESUME:-0}"
 export NODELIST="${NODELIST:-firefly1,firefly2,firefly3,pegasus2}"
 export EVAL_NODELIST="${EVAL_NODELIST:-$NODELIST}"
 export CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
+export MISTRAL_LOCAL_SNAPSHOT="${MISTRAL_LOCAL_SNAPSHOT:-$ROOT/../models/Mistral-3-24b}"
 
 case "$RUN_MODE" in
   auto|fresh|resume) ;;
@@ -52,8 +53,22 @@ tf_split_csv "$TF_OPTIMIZERS" optimizers
 tf_split_csv "$TF_SEEDS" seeds
 
 for model in "${models[@]}"; do
+  tf_contains "$model" gpt-oss-120b qwen-3-30b mistral-3-24b \
+    || tf_die "Unsupported model '$model'"
+
   if [[ "$model" == "gpt-oss-120b" ]] && ((MAX_OUTPUT_TOKENS < 96)); then
     tf_die "GPT-OSS-120B requires MAX_OUTPUT_TOKENS>=96; got $MAX_OUTPUT_TOKENS"
+  fi
+
+  if [[ "$model" == "mistral-3-24b" ]]; then
+    [[ -d "$MISTRAL_LOCAL_SNAPSHOT" ]] \
+      || tf_die "Missing Mistral model directory: $MISTRAL_LOCAL_SNAPSHOT"
+    for required_file in config.json params.json tekken.json; do
+      [[ -s "$MISTRAL_LOCAL_SNAPSHOT/$required_file" ]] \
+        || tf_die "Missing Mistral file: $MISTRAL_LOCAL_SNAPSHOT/$required_file"
+    done
+    compgen -G "$MISTRAL_LOCAL_SNAPSHOT/consolidated*.safetensors" >/dev/null \
+      || tf_die "Missing Mistral consolidated*.safetensors weights in $MISTRAL_LOCAL_SNAPSHOT"
   fi
 done
 
@@ -119,6 +134,7 @@ printf '  strict budget:%s\n' "$STRICT_TOKEN_BUDGET"
 printf '  near mode:    %s\n' "$NEAR_BUDGET_FRACTION"
 printf '  min utilize:  %s\n' "$MIN_BUDGET_UTILIZATION"
 printf '  output reserve:%s\n' "$OUTPUT_TOKEN_RESERVE"
+printf '  mistral path: %s\n' "$MISTRAL_LOCAL_SNAPSHOT"
 printf '  array:        %s (%d tasks)\n' "$array_spec" "$total"
 
 if tf_is_true "$DRY_RUN"; then

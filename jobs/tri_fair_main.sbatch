@@ -32,6 +32,9 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck source=jobs/lib/common.sh
 source jobs/lib/common.sh
 
+# Offline model location used for Mistral optimization and child evaluation jobs.
+export MISTRAL_LOCAL_SNAPSHOT="${MISTRAL_LOCAL_SNAPSHOT:-$ROOT/../models/Mistral-3-24b}"
+
 TF_MODELS="${TF_MODELS:-qwen-3-30b}"
 TF_DATASETS="${TF_DATASETS:-bbq,bias_in_bios,civil_comments}"
 TF_OPTIMIZERS="${TF_OPTIMIZERS:-Tri-Fair,NSGAII-PO-Fair}"
@@ -39,7 +42,7 @@ TF_SEEDS="${TF_SEEDS:-42,43,44}"
 BUDGET="${BUDGET:-1000000}"
 RUN_MODE="${RUN_MODE:-auto}"
 AUTO_EVAL="${AUTO_EVAL:-1}"
-MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2}"
+MANIFEST_DIR="${MANIFEST_DIR:-data/splits_v2_2}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-16}"
 META_MAX_OUTPUT_TOKENS="${META_MAX_OUTPUT_TOKENS:-256}"
 N_INIT_PROMPTS="${N_INIT_PROMPTS:-12}"
@@ -92,12 +95,25 @@ dataset="${datasets[$dataset_idx]}"
 optimizer="${optimizers[$optimizer_idx]}"
 seed="${seeds[$seed_idx]}"
 
+tf_contains "$model" gpt-oss-120b qwen-3-30b mistral-3-24b \
+  || tf_die "Unsupported Tri-Fair model '$model'"
 tf_contains "$dataset" bbq bias_in_bios civil_comments \
   || tf_die "Unsupported Tri-Fair dataset '$dataset'"
 tf_contains "$optimizer" Tri-Fair NSGAII-PO-Fair \
   || tf_die "Unsupported main-study optimizer '$optimizer'"
 tf_contains "$seed" 42 43 44 \
   || tf_warn "Seed $seed is outside the planned main-study seeds 42,43,44"
+
+if [[ "$model" == "mistral-3-24b" ]]; then
+  [[ -d "$MISTRAL_LOCAL_SNAPSHOT" ]] \
+    || tf_die "Missing Mistral model directory: $MISTRAL_LOCAL_SNAPSHOT"
+  for required_file in config.json params.json tekken.json; do
+    [[ -s "$MISTRAL_LOCAL_SNAPSHOT/$required_file" ]] \
+      || tf_die "Missing Mistral file: $MISTRAL_LOCAL_SNAPSHOT/$required_file"
+  done
+  compgen -G "$MISTRAL_LOCAL_SNAPSHOT/consolidated*.safetensors" >/dev/null \
+    || tf_die "Missing Mistral consolidated*.safetensors weights in $MISTRAL_LOCAL_SNAPSHOT"
+fi
 
 checkpoints="$(tf_stage_checkpoints "$BUDGET")"
 output_dir="$(tf_run_output_dir "$ROOT" "$model" "$dataset" "$optimizer" "$seed")"
@@ -230,7 +246,7 @@ tf_log "Optimization stage completed successfully: $logging_dir"
 # Holdout evaluation is a separate GPU job. This keeps a failed evaluation from
 # invalidating an otherwise valid optimization run and makes reruns idempotent.
 if tf_is_true "$AUTO_EVAL"; then
-  export MANIFEST_DIR MAX_OUTPUT_TOKENS
+  export MANIFEST_DIR MAX_OUTPUT_TOKENS TF_RESULTS_NAMESPACE MISTRAL_LOCAL_SNAPSHOT
   eval_sbatch_args=(--parsable)
   [[ -n "${EVAL_NODELIST:-}" ]] && eval_sbatch_args+=("--nodelist=$EVAL_NODELIST")
   if eval_job="$(sbatch "${eval_sbatch_args[@]}" jobs/run_eval.sbatch \
